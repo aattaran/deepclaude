@@ -169,11 +169,36 @@ Or on macOS/Linux:
 }
 ```
 
-## Advanced: Remote control proxy
+## Remote control (`--remote`)
 
-For Claude Code remote-control sessions (`claude remote-control`), the brain swap requires a local proxy because the bridge authentication must go to Anthropic while model calls go to DeepSeek.
+Open a Claude Code session in any browser — with DeepSeek as the brain:
 
-See [proxy/README.md](proxy/README.md) for the proxy setup.
+```bash
+cheapclaude --remote                # Remote control + DeepSeek
+cheapclaude --remote -b or          # Remote control + OpenRouter
+cheapclaude --remote -b anthropic   # Remote control + Anthropic (normal)
+```
+
+This prints a `https://claude.ai/code/session_...` URL you can open on your phone, tablet, or any browser.
+
+### How it works
+
+Remote control needs Anthropic's bridge for the WebSocket connection, but model calls can go elsewhere. cheapclaude starts a local proxy that splits the traffic:
+
+```
+claude remote-control
+  ├── Bridge WebSocket → wss://bridge.claudeusercontent.com (Anthropic, hardcoded)
+  └── Model API calls  → http://localhost:3200 (proxy)
+                            ├── /v1/messages → DeepSeek ($0.87/M)
+                            └── everything else → Anthropic (passthrough)
+```
+
+### Prerequisites
+- Must be logged into Claude Code: `claude auth login`
+- Must have a claude.ai subscription (the bridge is Anthropic infrastructure)
+- Node.js 18+ (for the proxy)
+
+The proxy starts automatically and stops when the session ends. See [proxy/README.md](proxy/README.md) for technical details.
 
 ## License
 
