@@ -12,11 +12,14 @@
     deepclaude --status             # Show keys and backends
     deepclaude --cost               # Pricing comparison
     deepclaude --benchmark          # Latency test
+    deepclaude --switch ds          # Switch proxy mid-session
 #>
 
 param(
     [Alias("b")]
     [string]$Backend,
+    [Alias("s")]
+    [string]$Switch,
     [Alias("r")]
     [switch]$Remote,
     [switch]$Status,
@@ -27,7 +30,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-if (-not $Backend -and -not $Status -and -not $Cost -and -not $Benchmark -and -not $Help) {
+if (-not $Backend -and -not $Switch -and -not $Status -and -not $Cost -and -not $Benchmark -and -not $Help) {
     $Backend = if ($env:CHEAPCLAUDE_DEFAULT_BACKEND) { $env:CHEAPCLAUDE_DEFAULT_BACKEND } else { "ds" }
 }
 
@@ -111,9 +114,10 @@ if ($Cost) {
 if ($Help) {
     Write-Host "deepclaude - Claude Code with cheap backends"
     Write-Host ""
-    Write-Host "Usage: deepclaude [-b backend] [--status] [--cost] [--benchmark]"
+    Write-Host "Usage: deepclaude [-b backend] [-s backend] [--status] [--cost] [--benchmark]"
     Write-Host ""
     Write-Host "  -b, --backend   ds (default), or, fw, anthropic"
+    Write-Host "  -s, --switch    Switch proxy mid-session (ds, or, fw, anthropic)"
     Write-Host "  --status        Show keys and backends"
     Write-Host "  --cost          Pricing comparison"
     Write-Host "  --benchmark     Latency test"
@@ -147,6 +151,29 @@ if ($Benchmark) {
         }
     }
     Write-Host ""
+    exit 0
+}
+
+# --- Switch ---
+if ($Switch) {
+    $backend = $Switch
+    switch ($backend) {
+        { $_ -in "ds","deepseek" }   { $backend = "deepseek" }
+        { $_ -in "or","openrouter" } { $backend = "openrouter" }
+        { $_ -in "fw","fireworks" }  { $backend = "fireworks" }
+        "anthropic"                  { $backend = "anthropic" }
+        default {
+            Write-Host "ERROR: Unknown backend '$backend'. Use: ds, or, fw, anthropic" -ForegroundColor Red
+            exit 1
+        }
+    }
+    try {
+        $resp = Invoke-RestMethod -Uri "http://127.0.0.1:3200/_proxy/mode" -Method Post -Body "backend=$backend" -ErrorAction Stop
+        Write-Host "  Switched: $($resp.previous) -> $($resp.mode)"
+    } catch {
+        Write-Host "  Proxy not running. Start with: deepclaude" -ForegroundColor Red
+        exit 1
+    }
     exit 0
 }
 
