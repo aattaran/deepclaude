@@ -179,12 +179,14 @@ run_benchmark() {
             fireworks)  url="$FIREWORKS_URL"; key="${FIREWORKS_API_KEY:-}"; model="accounts/fireworks/models/deepseek-v4-pro" ;;
         esac
         if [[ -z "$key" ]]; then echo "  $name: SKIP (no key)"; continue; fi
-        local start_ms=$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')
+        local start_ms
+        start_ms=$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s)000
         local status=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$url/v1/messages" \
             -H "x-api-key: $key" -H "content-type: application/json" -H "anthropic-version: 2023-06-01" \
             -d "{\"model\":\"$model\",\"max_tokens\":32,\"messages\":[{\"role\":\"user\",\"content\":\"Reply: ok\"}]}" \
             --max-time 30 2>/dev/null || echo "timeout")
-        local end_ms=$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')
+        local end_ms
+        end_ms=$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s)000
         local elapsed=$((end_ms - start_ms))
         if [[ "$status" == "200" ]]; then
             echo "  $name: OK (${elapsed}ms)"
