@@ -6,6 +6,7 @@ import { Transform } from 'stream';
 const ANTHROPIC_FALLBACK = 'https://api.anthropic.com';
 const MODEL_PATHS = ['/v1/messages'];
 const REQUEST_TIMEOUT_MS = 5 * 60 * 1000; // 5 min per request
+const MAX_BODY_SIZE = 50 * 1024 * 1024; // 50 MB
 
 const PRICING_PER_M = {
     deepseek:   { input: 0.44,  output: 0.87 },
@@ -274,8 +275,20 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
             }
 
             const chunks = [];
-            clientReq.on('data', c => chunks.push(c));
+            let bodySize = 0;
+            clientReq.on('data', c => {
+                bodySize += c.length;
+                if (bodySize > MAX_BODY_SIZE) {
+                    console.error(`[MODEL-PROXY] #${reqCount} BODY_TOO_LARGE (${bodySize} bytes)`);
+                    clientRes.writeHead(413, { 'content-type': 'application/json' });
+                    clientRes.end(JSON.stringify({ error: { message: 'Request body too large' } }));
+                    clientReq.destroy();
+                    return;
+                }
+                chunks.push(c);
+            });
             clientReq.on('end', () => {
+                if (bodySize > MAX_BODY_SIZE) return;
                 const body = Buffer.concat(chunks);
                 const opts = {
                     hostname: dest.hostname,
