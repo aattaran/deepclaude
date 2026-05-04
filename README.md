@@ -12,8 +12,8 @@ Claude Code is the best autonomous coding agent — but it costs $200/month with
 
 ```
 Your terminal
-  └── Claude Code CLI (tool loop, file editing, bash, git — unchanged)
-        └── API calls → DeepSeek V4 Pro ($0.87/M) instead of Anthropic ($15/M)
+  +-- Claude Code CLI (tool loop, file editing, bash, git - unchanged)
+        +-- API calls -> DeepSeek V4 Pro ($0.87/M) instead of Anthropic ($15/M)
 ```
 
 Everything works: file reading, editing, bash execution, subagent spawning, autonomous multi-step coding loops. The only difference is which model thinks.
@@ -64,6 +64,7 @@ deepclaude --backend fw     # Use Fireworks AI (fastest, US servers)
 deepclaude --backend anthropic  # Normal Claude Code (when you need Opus)
 deepclaude --cost           # Show pricing comparison
 deepclaude --benchmark      # Latency test across all providers
+deepclaude --switch ds      # Switch backend mid-session (no restart)
 ```
 
 ## How it works
@@ -92,7 +93,7 @@ Claude Code reads these environment variables to determine where to send API cal
 
 ### Setup per backend
 
-**DeepSeek** (default — just needs `DEEPSEEK_API_KEY`):
+**DeepSeek** (default - just needs `DEEPSEEK_API_KEY`):
 ```bash
 setx DEEPSEEK_API_KEY "sk-..."           # Windows
 export DEEPSEEK_API_KEY="sk-..."         # macOS/Linux
@@ -118,7 +119,7 @@ export FIREWORKS_API_KEY="fw_..."        # macOS/Linux
 | Heavy (25 days/mo) | $200/mo (capped) | ~$50/mo | 75% |
 | With auto loops | $200/mo (capped) | ~$80/mo | 60% |
 
-DeepSeek's automatic context caching makes agent loops extremely cheap — after the first request, the system prompt and file context are cached at $0.004/M (vs $0.44/M uncached).
+DeepSeek's automatic context caching makes agent loops extremely cheap - after the first request, the system prompt and file context are cached at $0.004/M (vs $0.44/M uncached).
 
 ## What works and what doesn't
 
@@ -136,13 +137,131 @@ DeepSeek's automatic context caching makes agent loops extremely cheap — after
 | Feature | Reason |
 |---|---|
 | Image/vision input | DeepSeek's Anthropic endpoint doesn't support images |
-| Parallel tool use | Disabled — tools execute one at a time |
+| Parallel tool use | Disabled - tools execute one at a time |
 | MCP server tools | Not supported through compatibility layer |
 | Prompt caching savings | DeepSeek has its own caching (automatic), but Anthropic's `cache_control` is ignored |
 
 ### Intelligence difference
 - **Routine tasks** (80% of work): DeepSeek V4 Pro is comparable to Claude Opus
-- **Complex reasoning** (20%): Claude Opus is stronger — switch with `--backend anthropic`
+- **Complex reasoning** (20%): Claude Opus is stronger - switch with `--backend anthropic`
+
+## Live switching (no restart)
+
+Switch between Anthropic and DeepSeek **mid-session** - from inside Claude Code itself. No restart, no terminal commands. Just type a slash command.
+
+**In Claude Code terminal:**
+
+![/deepseek in Claude Code CLI](screenshots/terminal%20for%20terminal%20embed2.PNG)
+
+**In Claude Code VS Code extension:**
+
+![/deepseek in VS Code extension](screenshots/terminal%20for%20vscode%20embed2.PNG)
+
+### How it works
+
+The proxy runs on `localhost:3200` and intercepts all API calls. A control endpoint (`/_proxy/mode`) lets you switch the active backend instantly:
+
+```
+Claude Code -> localhost:3200 (proxy)
+                 |
+                 +-- /_proxy/mode POST -> switch backend
+                 +-- /_proxy/status GET -> current backend + uptime
+                 +-- /_proxy/cost GET -> token usage + cost savings
+                 |
+                 +-- /v1/messages -> active backend (DeepSeek/OpenRouter/Anthropic)
+                 +-- everything else -> Anthropic (passthrough)
+```
+
+### Option 1: Slash commands (recommended)
+
+Add these files to `~/.claude/commands/`:
+
+**`deepseek.md`:**
+```
+Switch the model proxy to DeepSeek. Run this command silently and report the result:
+curl -sX POST http://127.0.0.1:3200/_proxy/mode -d "backend=deepseek"
+If successful, say: "Switched to DeepSeek."
+```
+
+**`anthropic.md`:**
+```
+Switch the model proxy back to Anthropic. Run this command silently and report the result:
+curl -sX POST http://127.0.0.1:3200/_proxy/mode -d "backend=anthropic"
+If successful, say: "Switched to Anthropic."
+```
+
+**`openrouter.md`:**
+```
+Switch the model proxy to OpenRouter. Run this command silently and report the result:
+curl -sX POST http://127.0.0.1:3200/_proxy/mode -d "backend=openrouter"
+If successful, say: "Switched to OpenRouter."
+```
+
+Then type `/deepseek`, `/anthropic`, or `/openrouter` in any Claude Code session to switch instantly.
+
+### Option 2: CLI flag
+
+```bash
+deepclaude --switch deepseek    # or: ds, or, fw, anthropic
+deepclaude -s anthropic
+```
+
+### Option 3: VS Code keyboard shortcuts
+
+Add to `.vscode/tasks.json`:
+```json
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Proxy: Switch to DeepSeek",
+      "type": "shell",
+      "command": "Invoke-RestMethod -Uri http://127.0.0.1:3200/_proxy/mode -Method Post -Body 'backend=deepseek'",
+      "presentation": { "reveal": "always" },
+      "problemMatcher": []
+    },
+    {
+      "label": "Proxy: Switch to Anthropic",
+      "type": "shell",
+      "command": "Invoke-RestMethod -Uri http://127.0.0.1:3200/_proxy/mode -Method Post -Body 'backend=anthropic'",
+      "presentation": { "reveal": "always" },
+      "problemMatcher": []
+    }
+  ]
+}
+```
+
+Then bind in `keybindings.json`:
+```json
+{ "key": "ctrl+alt+d", "command": "workbench.action.tasks.runTask", "args": "Proxy: Switch to DeepSeek" },
+{ "key": "ctrl+alt+a", "command": "workbench.action.tasks.runTask", "args": "Proxy: Switch to Anthropic" }
+```
+
+### Cost tracking
+
+The proxy tracks token usage and calculates savings vs Anthropic pricing:
+
+```bash
+curl -s http://127.0.0.1:3200/_proxy/cost
+```
+
+Returns:
+```json
+{
+  "backends": {
+    "deepseek": {
+      "input_tokens": 125000,
+      "output_tokens": 45000,
+      "requests": 12,
+      "cost": 0.0941,
+      "anthropic_equivalent": 1.05
+    }
+  },
+  "total_cost": 0.0941,
+  "anthropic_equivalent": 1.05,
+  "savings": 0.9559
+}
+```
 
 ## VS Code / Cursor integration
 
@@ -171,62 +290,9 @@ Or on macOS/Linux:
 }
 ```
 
-## Live switching (no restart)
-
-Switch between Anthropic and DeepSeek mid-session — from inside Claude Code itself. No restart, no terminal commands. Just type a slash command.
-
-**In Claude Code terminal:**
-
-![/deepseek in Claude Code CLI](screenshots/terminal%20for%20terminal%20embed2.PNG)
-
-**In Claude Code VS Code extension:**
-
-![/deepseek in VS Code extension](screenshots/terminal%20for%20vscode%20embed2.PNG)
-
-### Setup
-
-1. Start the proxy once (it stays running):
-```bash
-deepclaude                          # starts in DeepSeek mode
-# or start just the proxy:
-node proxy/start-proxy.js           # starts on port 3200
-```
-
-2. Add these slash commands to `~/.claude/commands/`:
-
-**`deepseek.md`:**
-```
-Switch the model proxy to DeepSeek. Run this command silently and report the result:
-curl -sX POST http://127.0.0.1:3200/_proxy/mode -d "backend=deepseek"
-```
-
-**`anthropic.md`:**
-```
-Switch the model proxy back to Anthropic. Run this command silently and report the result:
-curl -sX POST http://127.0.0.1:3200/_proxy/mode -d "backend=anthropic"
-```
-
-3. Type `/deepseek` or `/anthropic` in any Claude Code session (terminal or VS Code) to switch instantly.
-
-### VS Code keyboard shortcuts (optional)
-
-Add to your VS Code `tasks.json`:
-```json
-{
-  "label": "Proxy: Switch to DeepSeek",
-  "type": "shell",
-  "command": "Invoke-RestMethod -Uri http://127.0.0.1:3200/_proxy/mode -Method Post -Body 'backend=deepseek'"
-}
-```
-
-Then bind to `Ctrl+Alt+D` in `keybindings.json`:
-```json
-{ "key": "ctrl+alt+d", "command": "workbench.action.tasks.runTask", "args": "Proxy: Switch to DeepSeek" }
-```
-
 ## Remote control (`--remote`)
 
-Open a Claude Code session in any browser — with DeepSeek as the brain:
+Open a Claude Code session in any browser - with DeepSeek as the brain:
 
 ```bash
 deepclaude --remote                # Remote control + DeepSeek
@@ -242,10 +308,10 @@ Remote control needs Anthropic's bridge for the WebSocket connection, but model 
 
 ```
 claude remote-control
-  ├── Bridge WebSocket → wss://bridge.claudeusercontent.com (Anthropic, hardcoded)
-  └── Model API calls  → http://localhost:3200 (proxy)
-                            ├── /v1/messages → DeepSeek ($0.87/M)
-                            └── everything else → Anthropic (passthrough)
+  +-- Bridge WebSocket -> wss://bridge.claudeusercontent.com (Anthropic, hardcoded)
+  +-- Model API calls  -> http://localhost:3200 (proxy)
+                            +-- /v1/messages -> DeepSeek ($0.87/M)
+                            +-- everything else -> Anthropic (passthrough)
 ```
 
 ### Prerequisites
