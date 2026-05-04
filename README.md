@@ -74,7 +74,7 @@ Claude Code reads these environment variables to determine where to send API cal
 | Variable | What it does |
 |---|---|
 | `ANTHROPIC_BASE_URL` | API endpoint (default: api.anthropic.com) |
-| `ANTHROPIC_AUTH_TOKEN` | API key for the backend |
+| `ANTHROPIC_API_KEY` | API key for the backend |
 | `ANTHROPIC_DEFAULT_OPUS_MODEL` | Model name for Opus-tier tasks |
 | `ANTHROPIC_DEFAULT_SONNET_MODEL` | Model name for Sonnet-tier tasks |
 | `ANTHROPIC_DEFAULT_HAIKU_MODEL` | Model name for Haiku-tier (subagents) |
@@ -86,7 +86,7 @@ Claude Code reads these environment variables to determine where to send API cal
 
 | Backend | Flag | Input/M | Output/M | Servers | Notes |
 |---|---|---|---|---|---|
-| **DeepSeek** (default) | `--backend ds` | $0.44 | $0.87 | China | Auto context caching (120x cheaper on repeat turns) |
+| **DeepSeek** (default) | `--backend ds` | $0.44 | $0.87 | China | Auto context caching (110x cheaper on repeat turns) |
 | **OpenRouter** | `--backend or` | $0.44 | $0.87 | US | Cheapest, lowest latency from US/EU |
 | **Fireworks AI** | `--backend fw` | $1.74 | $3.48 | US | Fastest inference |
 | **Anthropic** | `--backend anthropic` | $3.00 | $15.00 | US | Original Claude Opus (for hard problems) |
