@@ -218,8 +218,8 @@ if ($Remote) {
 
 # --- Launch ---
 if ($Backend -eq "anthropic") {
-    foreach ($v in @("ANTHROPIC_BASE_URL","ANTHROPIC_AUTH_TOKEN","ANTHROPIC_DEFAULT_OPUS_MODEL",
-        "ANTHROPIC_DEFAULT_SONNET_MODEL","ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    foreach ($v in @("ANTHROPIC_BASE_URL","ANTHROPIC_AUTH_TOKEN","ANTHROPIC_API_KEY",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL","ANTHROPIC_DEFAULT_SONNET_MODEL","ANTHROPIC_DEFAULT_HAIKU_MODEL",
         "CLAUDE_CODE_SUBAGENT_MODEL","CLAUDE_CODE_EFFORT_LEVEL")) {
         Remove-Item "Env:$v" -ErrorAction SilentlyContinue
     }
@@ -232,25 +232,61 @@ $p = $Providers[$Backend]
 if (-not $p) { Write-Host "ERROR: Unknown backend '$Backend'. Use: ds, or, fw, anthropic" -ForegroundColor Red; exit 1 }
 if (-not $p.key) { Write-Host "ERROR: $($p.keyName) not set" -ForegroundColor Red; exit 1 }
 
-Write-Host "`n  Launching Claude Code via $($p.name)..." -ForegroundColor Cyan
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+
+Write-Host "`n  Starting model proxy for $($p.name)..." -ForegroundColor Cyan
 Write-Host "  Endpoint: $($p.url)" -ForegroundColor DarkGray
 Write-Host "  Model: $($p.opus) (main) + $($p.haiku) (subagents)" -ForegroundColor DarkGray
 Write-Host ""
 
-$env:ANTHROPIC_BASE_URL = $p.url
-$env:ANTHROPIC_AUTH_TOKEN = $p.key
-$env:ANTHROPIC_MODEL = $p.opus
+$proxyScript = Join-Path $ScriptDir "proxy\start-proxy.js"
+$proxyProc = Start-Process -FilePath "node" -ArgumentList $proxyScript,$p.url,$p.key -PassThru -WindowStyle Hidden -RedirectStandardOutput "$env:TEMP\deepclaude-proxy-port.txt"
+
+$tries = 0
+while ($tries -lt 30) {
+    Start-Sleep -Milliseconds 200
+    $tries++
+    if (Test-Path "$env:TEMP\deepclaude-proxy-port.txt") {
+        $content = Get-Content "$env:TEMP\deepclaude-proxy-port.txt" -ErrorAction SilentlyContinue
+        if ($content) { break }
+    }
+}
+
+$proxyPort = (Get-Content "$env:TEMP\deepclaude-proxy-port.txt" -ErrorAction SilentlyContinue | Select-Object -First 1)
+Remove-Item "$env:TEMP\deepclaude-proxy-port.txt" -ErrorAction SilentlyContinue
+
+if (-not $proxyPort) {
+    Write-Host "ERROR: Proxy failed to start" -ForegroundColor Red
+    if ($proxyProc -and -not $proxyProc.HasExited) { Stop-Process -Id $proxyProc.Id -Force }
+    exit 1
+}
+
+Write-Host "  Proxy on :$proxyPort -> $($p.url)" -ForegroundColor DarkGray
+Write-Host "  Cost tracking: curl http://127.0.0.1:$proxyPort/_proxy/cost" -ForegroundColor DarkGray
+Write-Host ""
+
+# Route Claude Code through the proxy so cost tracking and /switch work.
+# Proxy replaces auth in-flight — backend key is also set as ANTHROPIC_API_KEY
+# so Claude Code starts cleanly regardless of login state.
+$env:ANTHROPIC_BASE_URL = "http://127.0.0.1:$proxyPort"
+$env:ANTHROPIC_API_KEY = $p.key
 $env:ANTHROPIC_DEFAULT_OPUS_MODEL = $p.opus
 $env:ANTHROPIC_DEFAULT_SONNET_MODEL = $p.sonnet
 $env:ANTHROPIC_DEFAULT_HAIKU_MODEL = $p.haiku
 $env:CLAUDE_CODE_SUBAGENT_MODEL = $p.subagent
 $env:CLAUDE_CODE_EFFORT_LEVEL = "max"
-Remove-Item Env:ANTHROPIC_API_KEY -ErrorAction SilentlyContinue
+Remove-Item Env:ANTHROPIC_AUTH_TOKEN -ErrorAction SilentlyContinue
 
-& claude @Args
-
-foreach ($v in @("ANTHROPIC_BASE_URL","ANTHROPIC_AUTH_TOKEN","ANTHROPIC_MODEL",
-    "ANTHROPIC_DEFAULT_OPUS_MODEL","ANTHROPIC_DEFAULT_SONNET_MODEL",
-    "ANTHROPIC_DEFAULT_HAIKU_MODEL","CLAUDE_CODE_SUBAGENT_MODEL","CLAUDE_CODE_EFFORT_LEVEL")) {
-    Remove-Item "Env:$v" -ErrorAction SilentlyContinue
+try {
+    & claude @Args
+} finally {
+    if ($proxyProc -and -not $proxyProc.HasExited) {
+        Stop-Process -Id $proxyProc.Id -Force -ErrorAction SilentlyContinue
+        Write-Host "  Proxy stopped." -ForegroundColor DarkGray
+    }
+    foreach ($v in @("ANTHROPIC_BASE_URL","ANTHROPIC_API_KEY","ANTHROPIC_DEFAULT_OPUS_MODEL",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL","ANTHROPIC_DEFAULT_HAIKU_MODEL",
+        "CLAUDE_CODE_SUBAGENT_MODEL","CLAUDE_CODE_EFFORT_LEVEL")) {
+        Remove-Item "Env:$v" -ErrorAction SilentlyContinue
+    }
 }
