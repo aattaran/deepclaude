@@ -247,10 +247,12 @@ $env:CLAUDE_CODE_SUBAGENT_MODEL = $p.subagent
 $env:CLAUDE_CODE_EFFORT_LEVEL = "max"
 Remove-Item Env:ANTHROPIC_API_KEY -ErrorAction SilentlyContinue
 
-& claude @Args
-
-foreach ($v in @("ANTHROPIC_BASE_URL","ANTHROPIC_AUTH_TOKEN","ANTHROPIC_MODEL",
-    "ANTHROPIC_DEFAULT_OPUS_MODEL","ANTHROPIC_DEFAULT_SONNET_MODEL",
-    "ANTHROPIC_DEFAULT_HAIKU_MODEL","CLAUDE_CODE_SUBAGENT_MODEL","CLAUDE_CODE_EFFORT_LEVEL")) {
-    Remove-Item "Env:$v" -ErrorAction SilentlyContinue
+try {
+    & claude @Args
+} finally {
+    foreach ($v in @("ANTHROPIC_BASE_URL","ANTHROPIC_AUTH_TOKEN","ANTHROPIC_MODEL",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL","ANTHROPIC_DEFAULT_SONNET_MODEL",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL","CLAUDE_CODE_SUBAGENT_MODEL","CLAUDE_CODE_EFFORT_LEVEL")) {
+        Remove-Item "Env:$v" -ErrorAction SilentlyContinue
+    }
 }
