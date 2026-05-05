@@ -7,6 +7,23 @@ const ANTHROPIC_FALLBACK = 'https://api.anthropic.com';
 const MODEL_PATHS = ['/v1/messages'];
 const REQUEST_TIMEOUT_MS = 5 * 60 * 1000; // 5 min per request
 
+const MODEL_REMAP = {
+    deepseek: {
+        'claude-opus-4-6':    'deepseek-v4-pro',
+        'claude-opus-4-7':    'deepseek-v4-pro',
+        'claude-sonnet-4-6':  'deepseek-v4-flash',
+        'claude-sonnet-4-5-20250929': 'deepseek-v4-flash',
+        'claude-haiku-4-5-20251001':  'deepseek-v4-flash',
+    },
+    openrouter: {
+        'claude-opus-4-6':    'deepseek/deepseek-v4-pro',
+        'claude-opus-4-7':    'deepseek/deepseek-v4-pro',
+        'claude-sonnet-4-6':  'deepseek/deepseek-v4-flash',
+        'claude-sonnet-4-5-20250929': 'deepseek/deepseek-v4-flash',
+        'claude-haiku-4-5-20251001':  'deepseek/deepseek-v4-flash',
+    },
+};
+
 const PRICING_PER_M = {
     deepseek:   { input: 0.44,  output: 0.87 },
     openrouter: { input: 0.44,  output: 0.87 },
@@ -276,7 +293,21 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
             const chunks = [];
             clientReq.on('data', c => chunks.push(c));
             clientReq.on('end', () => {
-                const body = Buffer.concat(chunks);
+                let body = Buffer.concat(chunks);
+
+                // Remap Anthropic model names to backend-specific names
+                if (isModelCall && MODEL_REMAP[state.mode]) {
+                    try {
+                        const parsed = JSON.parse(body);
+                        const mapped = MODEL_REMAP[state.mode][parsed.model];
+                        if (mapped) {
+                            console.log(`[MODEL-PROXY] #${reqId} model remap: ${parsed.model} → ${mapped}`);
+                            parsed.model = mapped;
+                            body = Buffer.from(JSON.stringify(parsed));
+                        }
+                    } catch { /* not JSON or parse error, pass through */ }
+                }
+
                 const opts = {
                     hostname: dest.hostname,
                     port: dest.port || 443,
