@@ -22,6 +22,13 @@ const MODEL_REMAP = {
         'claude-sonnet-4-5-20250929': 'deepseek/deepseek-v4-flash',
         'claude-haiku-4-5-20251001':  'deepseek/deepseek-v4-flash',
     },
+    fireworks: {
+        'claude-opus-4-6':    'accounts/fireworks/models/deepseek-v4-pro',
+        'claude-opus-4-7':    'accounts/fireworks/models/deepseek-v4-pro',
+        'claude-sonnet-4-6':  'accounts/fireworks/models/deepseek-v4-flash',
+        'claude-sonnet-4-5-20250929': 'accounts/fireworks/models/deepseek-v4-flash',
+        'claude-haiku-4-5-20251001':  'accounts/fireworks/models/deepseek-v4-flash',
+    },
 };
 
 const PRICING_PER_M = {
