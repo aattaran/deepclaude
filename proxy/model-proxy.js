@@ -122,6 +122,26 @@ function stripUnsignedThinkingBlocks(body) {
     }
 }
 
+// True if any message contains an `image` content block, including nested
+// inside `tool_result` content arrays (Claude Code's Read tool wraps a
+// returned PNG in tool_result.content rather than at the top level).
+function containsImageBlock(messages) {
+    if (!Array.isArray(messages)) return false;
+    const blockHasImage = (block) => {
+        if (!block) return false;
+        if (block.type === 'image') return true;
+        if (block.type === 'tool_result' && Array.isArray(block.content)) {
+            return block.content.some(blockHasImage);
+        }
+        return false;
+    };
+    for (const msg of messages) {
+        if (!Array.isArray(msg.content)) continue;
+        if (msg.content.some(blockHasImage)) return true;
+    }
+    return false;
+}
+
 export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends, defaultMode }) {
     return new Promise((resolve, reject) => {
         const initialTarget = new URL(targetUrl);
@@ -270,50 +290,90 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                 return;
             }
 
-            // In anthropic mode, everything passes through transparently
-            const isAnthropicMode = state.mode === 'anthropic';
-            const isModelCall = !isAnthropicMode && MODEL_PATHS.includes(urlPath);
-            const dest = isModelCall ? state.target : new URL(ANTHROPIC_FALLBACK);
-
-            // Build upstream path. target.pathname may overlap with
-            // clientReq.url (e.g. OpenRouter /api/v1 + /v1/messages).
-            // Strip the shared prefix to avoid /api/v1/v1/messages.
-            let fullPath;
-            if (isModelCall) {
-                const base = state.target.pathname.replace(/\/$/, '');
-                let overlap = '';
-                for (let i = 1; i <= Math.min(base.length, urlPath.length); i++) {
-                    if (base.endsWith(urlPath.substring(0, i))) overlap = urlPath.substring(0, i);
-                }
-                fullPath = overlap ? base + urlPath.substring(overlap.length) : base + urlPath;
-            } else {
-                fullPath = clientReq.url;
-            }
-
             const reqId = ++reqCount;
             const t0 = Date.now();
 
-            if (isModelCall) {
-                console.log(`[MODEL-PROXY] #${reqId} → ${dest.hostname}${fullPath}`);
-            }
-
-            const headers = { ...clientReq.headers, host: dest.host };
-            delete headers['content-length'];
-
-            if (isModelCall) {
-                delete headers['authorization'];
-                delete headers['x-api-key'];
-                if (state.useBearer) {
-                    headers['authorization'] = `Bearer ${state.apiKey}`;
-                } else {
-                    headers['x-api-key'] = state.apiKey;
-                }
-            }
-
+            // Routing is deferred to after the body is read so we can detect
+            // image content blocks and (optionally) flip a single request
+            // from a non-Anthropic backend to api.anthropic.com — which
+            // preserves full pixel-level vision quality on the user's Max
+            // OAuth token. Disable with DEEPCLAUDE_IMAGE_FALLBACK=off.
             const chunks = [];
             clientReq.on('data', c => chunks.push(c));
             clientReq.on('end', () => {
                 let body = Buffer.concat(chunks);
+
+                const imageFallbackEnabled = (process.env.DEEPCLAUDE_IMAGE_FALLBACK || 'anthropic') !== 'off';
+                let forceAnthropicForImage = false;
+                if (imageFallbackEnabled && state.mode !== 'anthropic' && MODEL_PATHS.includes(urlPath)) {
+                    try {
+                        const parsed = JSON.parse(body);
+                        if (containsImageBlock(parsed.messages)) {
+                            forceAnthropicForImage = true;
+                        }
+                    } catch {}
+                }
+
+                const isAnthropicMode = state.mode === 'anthropic' || forceAnthropicForImage;
+                const isModelCall = !isAnthropicMode && MODEL_PATHS.includes(urlPath);
+                const dest = isModelCall ? state.target : new URL(ANTHROPIC_FALLBACK);
+                // Image turns are tracked under "anthropic" so cost/savings reflect
+                // where the request actually went.
+                const effectiveMode = forceAnthropicForImage ? 'anthropic' : state.mode;
+
+                // Build upstream path. target.pathname may overlap with
+                // clientReq.url (e.g. OpenRouter /api/v1 + /v1/messages).
+                // Strip the shared prefix to avoid /api/v1/v1/messages.
+                let fullPath;
+                if (isModelCall) {
+                    const base = state.target.pathname.replace(/\/$/, '');
+                    let overlap = '';
+                    for (let i = 1; i <= Math.min(base.length, urlPath.length); i++) {
+                        if (base.endsWith(urlPath.substring(0, i))) overlap = urlPath.substring(0, i);
+                    }
+                    fullPath = overlap ? base + urlPath.substring(overlap.length) : base + urlPath;
+                } else {
+                    fullPath = clientReq.url;
+                }
+
+                if (isModelCall || forceAnthropicForImage) {
+                    const tag = forceAnthropicForImage ? ' [image→anthropic]' : '';
+                    console.log(`[MODEL-PROXY] #${reqId} → ${dest.hostname}${fullPath}${tag}`);
+                }
+
+                const headers = { ...clientReq.headers, host: dest.host };
+                delete headers['content-length'];
+                // Force plain bytes upstream — the proxy mutates response bodies
+                // (UsageNormalizer, normalizeJsonBody) and would otherwise emit a
+                // `content-encoding: gzip` header followed by non-gzip bytes,
+                // producing client-side `Decompression error: ZlibError`.
+                delete headers['accept-encoding'];
+
+                if (isModelCall) {
+                    delete headers['authorization'];
+                    delete headers['x-api-key'];
+                    if (state.useBearer) {
+                        headers['authorization'] = `Bearer ${state.apiKey}`;
+                    } else {
+                        headers['x-api-key'] = state.apiKey;
+                    }
+                }
+                // For forceAnthropicForImage we leave the client's auth headers
+                // intact so Claude Code's OAuth bearer (Max) flows through to
+                // api.anthropic.com unchanged.
+
+                // When auto-routing to Anthropic for vision, drop the request
+                // `thinking` field and `context_management`. The
+                // `clear_thinking_*` strategies require thinking to be enabled,
+                // and Anthropic 400s on the mismatch.
+                if (forceAnthropicForImage) {
+                    try {
+                        const parsed = JSON.parse(body);
+                        delete parsed.thinking;
+                        delete parsed.context_management;
+                        body = Buffer.from(JSON.stringify(parsed));
+                    } catch {}
+                }
 
                 // Remap Anthropic model names to backend-specific names
                 if (isModelCall && MODEL_REMAP[state.mode]) {
@@ -331,13 +391,13 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                 // Strip thinking blocks before forwarding.
                 // Non-Anthropic: strip ALL blocks — backends reject thinking blocks
                 // they didn't generate, even unsigned ones.
-                // Anthropic after a non-Anthropic session: also strip ALL, because
-                // foreign backends generate signed-but-invalid thinking blocks that
-                // stripUnsignedThinkingBlocks passes through, causing Anthropic 400s.
+                // Anthropic after a non-Anthropic session OR image-routed: also strip
+                // ALL, because foreign backends generate signed-but-invalid thinking
+                // blocks that stripUnsignedThinkingBlocks would pass through.
                 if (isAnthropicMode && MODEL_PATHS.includes(urlPath)) {
                     try {
                         const parsed = JSON.parse(body);
-                        if (state.hadNonAnthropicSession) {
+                        if (state.hadNonAnthropicSession || forceAnthropicForImage) {
                             stripAllThinkingBlocks(parsed);
                         } else {
                             stripUnsignedThinkingBlocks(parsed);
@@ -362,8 +422,9 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                     timeout: REQUEST_TIMEOUT_MS,
                 };
 
+                const trackUsage = isModelCall || forceAnthropicForImage;
                 const proxyReq = httpsRequest(opts, (proxyRes) => {
-                    if (isModelCall) {
+                    if (trackUsage) {
                         const ttfb = Date.now() - t0;
                         console.log(`[MODEL-PROXY] #${reqId} TTFB ${ttfb}ms (status ${proxyRes.statusCode})`);
                     }
@@ -371,14 +432,19 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                     const ct = proxyRes.headers['content-type'] || '';
                     const isSSE = ct.includes('text/event-stream');
 
-                    if (isModelCall && isSSE) {
-                        clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
-                        const norm = new UsageNormalizer((inp, out) => recordUsage(state.mode, inp, out));
+                    if (trackUsage && isSSE) {
+                        // Strip content-encoding from forwarded headers — proxy
+                        // mutates the body via UsageNormalizer (toString on bytes),
+                        // so any upstream gzip bytes would arrive at the client
+                        // with the gzip header but non-gzip payload.
+                        const { 'content-encoding': _ce1, ...sseHeaders } = proxyRes.headers;
+                        clientRes.writeHead(proxyRes.statusCode, sseHeaders);
+                        const norm = new UsageNormalizer((inp, out) => recordUsage(effectiveMode, inp, out));
                         proxyRes.pipe(norm).pipe(clientRes);
                         proxyRes.on('end', () => {
                             console.log(`[MODEL-PROXY] #${reqId} done in ${((Date.now() - t0) / 1000).toFixed(1)}s (${norm._inputTokens}in/${norm._outputTokens}out)`);
                         });
-                    } else if (isModelCall && ct.includes('application/json')) {
+                    } else if (trackUsage && ct.includes('application/json')) {
                         const respChunks = [];
                         proxyRes.on('data', c => respChunks.push(c));
                         proxyRes.on('end', () => {
@@ -386,18 +452,19 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                             const fixed = normalizeJsonBody(raw);
                             try {
                                 const j = JSON.parse(fixed);
-                                if (j.usage) recordUsage(state.mode, j.usage.input_tokens, j.usage.output_tokens);
+                                if (j.usage) recordUsage(effectiveMode, j.usage.input_tokens, j.usage.output_tokens);
                             } catch {}
-                            const outHeaders = { ...proxyRes.headers, 'content-length': fixed.length };
+                            const { 'content-encoding': _ce2, ...jsonHeaders } = proxyRes.headers;
+                            const outHeaders = { ...jsonHeaders, 'content-length': fixed.length };
                             clientRes.writeHead(proxyRes.statusCode, outHeaders);
                             clientRes.end(fixed);
                             console.log(`[MODEL-PROXY] #${reqId} done in ${((Date.now() - t0) / 1000).toFixed(1)}s (json, ${fixed.length}b)`);
                         });
                     } else {
-                        // Non-model or unknown content-type: pass through
+                        // Non-model or unknown content-type: pass through unchanged.
                         clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
                         proxyRes.pipe(clientRes);
-                        if (isModelCall) {
+                        if (trackUsage) {
                             proxyRes.on('end', () => {
                                 console.log(`[MODEL-PROXY] #${reqId} done in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
                             });
