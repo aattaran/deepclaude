@@ -7,6 +7,11 @@ const ANTHROPIC_FALLBACK = 'https://api.anthropic.com';
 const MODEL_PATHS = ['/v1/messages'];
 const REQUEST_TIMEOUT_MS = 5 * 60 * 1000; // 5 min per request
 
+// Strict allowlist for the Origin header on /_proxy/mode. Must match the
+// loopback host exactly (with optional port) — a prefix check would let
+// http://localhost.attacker.com:3200 through and enable DNS-rebinding CSRF.
+const LOCAL_ORIGIN_RE = /^http:\/\/(?:127\.0\.0\.1|localhost|\[::1\])(?::\d{1,5})?$/i;
+
 const MODEL_REMAP = {
     deepseek: {
         'claude-opus-4-6':    'deepseek-v4-pro',
@@ -228,7 +233,7 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                 }
                 if (urlPath === '/_proxy/mode' && clientReq.method === 'POST') {
                     const origin = clientReq.headers['origin'] || '';
-                    if (origin && !origin.startsWith('http://127.0.0.1') && !origin.startsWith('http://localhost')) {
+                    if (origin && !LOCAL_ORIGIN_RE.test(origin)) {
                         clientRes.writeHead(403, { 'content-type': 'application/json' });
                         clientRes.end(JSON.stringify({ error: 'Forbidden' }));
                         return;
