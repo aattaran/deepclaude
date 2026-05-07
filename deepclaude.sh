@@ -141,7 +141,11 @@ start_proxy() {
     local tries=0
     while [[ -z "$proxy_port" ]] && [[ $tries -lt 30 ]]; do
         if kill -0 "$PROXY_PID" 2>/dev/null; then
-            proxy_port=$(grep -E '^[0-9]+$' "$PROXY_LOG" 2>/dev/null | head -1)
+            # `|| true`: with `set -o pipefail`, grep returning no matches
+            # (exit 1) propagates as a pipeline failure that `set -e` exits
+            # on. We expect zero matches on early iterations before the
+            # proxy emits its port, so swallow the status here.
+            proxy_port=$(grep -E '^[0-9]+$' "$PROXY_LOG" 2>/dev/null | head -1 || true)
         else
             echo "ERROR: Proxy process died during startup" >&2
             echo "  Log: $PROXY_LOG" >&2
