@@ -29,15 +29,14 @@ PROXY_PID=""
 # --- Parse args ---
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --backend|-b)         BACKEND="$2"; shift 2 ;;
-        --switch|-s)          ACTION="switch"; SWITCH_BACKEND="$2"; shift 2 ;;
-        --remote|-r)          ACTION="remote"; shift ;;
-        --status)             ACTION="status"; shift ;;
-        --cost)               ACTION="cost"; shift ;;
-        --benchmark)          ACTION="benchmark"; shift ;;
-        --install-statusline) ACTION="install-statusline"; shift ;;
-        --help|-h)            ACTION="help"; shift ;;
-        *)                    break ;;
+        --backend|-b) BACKEND="$2"; shift 2 ;;
+        --switch|-s)  ACTION="switch"; SWITCH_BACKEND="$2"; shift 2 ;;
+        --remote|-r)  ACTION="remote"; shift ;;
+        --status)     ACTION="status"; shift ;;
+        --cost)       ACTION="cost"; shift ;;
+        --benchmark)  ACTION="benchmark"; shift ;;
+        --help|-h)    ACTION="help"; shift ;;
+        *)            break ;;
     esac
 done
 
@@ -207,8 +206,6 @@ show_help() {
     echo "  --cost                               Pricing comparison"
     echo "  --benchmark                          Latency test"
     echo "  -s, --switch <backend>               Switch proxy mid-session"
-    echo "  --install-statusline                 Add Claude Code statusLine showing"
-    echo "                                       routing + cumulative cost (requires jq)"
     echo "  -h, --help                           This help"
     echo ""
     echo "Environment variables:"
@@ -218,37 +215,36 @@ show_help() {
     echo "  CHEAPCLAUDE_DEFAULT_BACKEND  Default backend (default: ds)"
 }
 
-do_install_statusline() {
-    if ! command -v jq >/dev/null 2>&1; then
-        echo "ERROR: jq is required to merge ~/.claude/settings.json" >&2
-        echo "  Install with: brew install jq  (or your platform equivalent)" >&2
-        exit 1
-    fi
+# Auto-installs the deepclaude statusLine into ~/.claude/settings.json on
+# every launch. No-op if the user already has a statusLine configured
+# (either ours or their own custom command). Silent skip if jq isn't on
+# PATH so deepclaude still launches without it.
+ensure_statusline_installed() {
+    command -v jq >/dev/null 2>&1 || return 0
 
     local script_path="$SCRIPT_DIR/bin/deepclaude-statusline"
-    if [[ ! -x "$script_path" ]]; then
-        echo "ERROR: $script_path not found or not executable" >&2
-        exit 1
-    fi
+    [[ -x "$script_path" ]] || return 0
 
     local settings_dir="$HOME/.claude"
     local settings_file="$settings_dir/settings.json"
     mkdir -p "$settings_dir"
-    if [[ ! -f "$settings_file" ]]; then
-        echo '{}' > "$settings_file"
+    [[ -f "$settings_file" ]] || echo '{}' > "$settings_file"
+
+    local existing
+    existing=$(jq -r '.statusLine.command // empty' "$settings_file" 2>/dev/null || echo "")
+
+    if [[ -z "$existing" ]]; then
+        local tmp
+        tmp=$(mktemp)
+        if jq --arg cmd "$script_path" \
+            '. + {statusLine: {type: "command", command: $cmd}}' \
+            "$settings_file" > "$tmp"; then
+            mv "$tmp" "$settings_file"
+            echo "  Installed deepclaude statusLine in $settings_file"
+        else
+            rm -f "$tmp"
+        fi
     fi
-
-    local tmp
-    tmp=$(mktemp)
-    # Merge into existing settings.json (preserves any other keys the user
-    # has set, e.g. permissions, hooks).
-    jq --arg cmd "$script_path" \
-        '. + {statusLine: {type: "command", command: $cmd}}' \
-        "$settings_file" > "$tmp"
-    mv "$tmp" "$settings_file"
-
-    echo "  Installed statusLine: $script_path"
-    echo "  ~/.claude/settings.json updated. Restart Claude Code to see the new line."
 }
 
 do_switch() {
@@ -306,6 +302,7 @@ launch_claude() {
     fi
 
     resolve_backend
+    ensure_statusline_installed
 
     echo "  Starting model proxy for $BACKEND..."
     start_proxy
@@ -334,6 +331,7 @@ launch_remote() {
     fi
 
     resolve_backend
+    ensure_statusline_installed
 
     echo "  Starting model proxy for $BACKEND..."
 
@@ -371,12 +369,11 @@ launch_remote() {
 
 # --- Main ---
 case "$ACTION" in
-    status)             show_status ;;
-    cost)               show_cost ;;
-    benchmark)          run_benchmark ;;
-    help)               show_help ;;
-    switch)             do_switch ;;
-    install-statusline) do_install_statusline ;;
-    remote)             launch_remote "$@" ;;
+    status)    show_status ;;
+    cost)      show_cost ;;
+    benchmark) run_benchmark ;;
+    help)      show_help ;;
+    switch)    do_switch ;;
+    remote)    launch_remote "$@" ;;
     launch)    launch_claude "$@" ;;
 esac
