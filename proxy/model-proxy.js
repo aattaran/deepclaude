@@ -379,12 +379,14 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                 if (isModelCall) {
                     try {
                         const parsed = JSON.parse(body);
-                        stripAllThinkingBlocks(parsed);
-                        // Top-level thinking/context_management have to go too.
-                        // DeepSeek 400s with "content[].thinking in the thinking
-                        // mode must be passed back" when the body advertises
-                        // thinking but messages don't carry the blocks (which
-                        // we just stripped, since foreign blocks are invalid).
+                        // DeepSeek's anthropic-compat endpoint expects its own
+                        // thinking blocks passed back verbatim for continuity
+                        // ("content[].thinking ... must be passed back"), so
+                        // we don't strip thinking blocks here. Top-level
+                        // thinking/context_management still go — non-Anthropic
+                        // backends don't honor Anthropic's extended-thinking
+                        // spec consistently, and a stale config field is a
+                        // noisier error than no config at all.
                         delete parsed.thinking;
                         delete parsed.context_management;
                         body = Buffer.from(JSON.stringify(parsed));
