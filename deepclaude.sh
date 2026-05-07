@@ -4,7 +4,17 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Resolve SCRIPT_DIR through any symlink chain (e.g. /usr/local/bin/deepclaude
+# -> /path/to/repo/deepclaude.sh) so $SCRIPT_DIR/proxy/... works regardless of
+# how the script was invoked.
+_source="${BASH_SOURCE[0]}"
+while [ -L "$_source" ]; do
+    _dir="$(cd "$(dirname "$_source")" && pwd)"
+    _source="$(readlink "$_source")"
+    [[ "$_source" != /* ]] && _source="$_dir/$_source"
+done
+SCRIPT_DIR="$(cd "$(dirname "$_source")" && pwd)"
+unset _source _dir
 
 # --- Config ---
 DEEPSEEK_URL="https://api.deepseek.com/anthropic"
@@ -19,14 +29,15 @@ PROXY_PID=""
 # --- Parse args ---
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --backend|-b) BACKEND="$2"; shift 2 ;;
-        --switch|-s)  ACTION="switch"; SWITCH_BACKEND="$2"; shift 2 ;;
-        --remote|-r)  ACTION="remote"; shift ;;
-        --status)     ACTION="status"; shift ;;
-        --cost)       ACTION="cost"; shift ;;
-        --benchmark)  ACTION="benchmark"; shift ;;
-        --help|-h)    ACTION="help"; shift ;;
-        *)            break ;;
+        --backend|-b)         BACKEND="$2"; shift 2 ;;
+        --switch|-s)          ACTION="switch"; SWITCH_BACKEND="$2"; shift 2 ;;
+        --remote|-r)          ACTION="remote"; shift ;;
+        --status)             ACTION="status"; shift ;;
+        --cost)               ACTION="cost"; shift ;;
+        --benchmark)          ACTION="benchmark"; shift ;;
+        --install-statusline) ACTION="install-statusline"; shift ;;
+        --help|-h)            ACTION="help"; shift ;;
+        *)                    break ;;
     esac
 done
 
@@ -83,6 +94,60 @@ set_model_env() {
     export ANTHROPIC_DEFAULT_HAIKU_MODEL="$RESOLVED_HAIKU"
     export CLAUDE_CODE_SUBAGENT_MODEL="$RESOLVED_SUBAGENT"
     export CLAUDE_CODE_EFFORT_LEVEL="max"
+}
+
+backend_long_name() {
+    case "$1" in
+        ds|deepseek)   echo "deepseek" ;;
+        or|openrouter) echo "openrouter" ;;
+        fw|fireworks)  echo "fireworks" ;;
+        anthropic)     echo "anthropic" ;;
+        *) echo "ERROR: Unknown backend '$1'. Use: ds, or, fw, anthropic" >&2; return 1 ;;
+    esac
+}
+
+# Sets PROXY_PID, PROXY_PORT, PROXY_LOG as script globals so the EXIT trap
+# can clean up the node child. Must be called WITHOUT command substitution
+# — $(start_proxy) runs in a subshell and globals never reach the parent.
+# Requires: RESOLVED_URL, RESOLVED_KEY, BACKEND already set.
+start_proxy() {
+    local backend_long
+    backend_long=$(backend_long_name "$BACKEND") || exit 1
+
+    PROXY_LOG="${PROXY_LOG:-/tmp/deepclaude-proxy.$$.log}"
+    : > "$PROXY_LOG"
+    node "$SCRIPT_DIR/proxy/start-proxy.js" "$RESOLVED_URL" "$RESOLVED_KEY" "$backend_long" >> "$PROXY_LOG" 2>&1 &
+    PROXY_PID=$!
+
+    # The proxy emits a banner line, then a bare-numeric port line on a
+    # successful bind. Match the bare integer to skip the banner; do not
+    # introduce other numeric-only stdout in proxy startup.
+    local proxy_port=""
+    local tries=0
+    while [[ -z "$proxy_port" ]] && [[ $tries -lt 30 ]]; do
+        if kill -0 "$PROXY_PID" 2>/dev/null; then
+            # `|| true`: with `set -o pipefail`, grep no-match (exit 1)
+            # would otherwise exit the script; we expect zero matches on
+            # early iterations before the proxy has emitted its port.
+            proxy_port=$(grep -E '^[0-9]+$' "$PROXY_LOG" 2>/dev/null | head -1 || true)
+        else
+            echo "ERROR: Proxy process died during startup" >&2
+            echo "  Log: $PROXY_LOG" >&2
+            tail -20 "$PROXY_LOG" >&2 2>/dev/null
+            exit 1
+        fi
+        [[ -z "$proxy_port" ]] && sleep 0.2
+        tries=$((tries + 1))
+    done
+
+    if [[ -z "$proxy_port" ]]; then
+        echo "ERROR: Proxy failed to report a port within 6s" >&2
+        echo "  Log: $PROXY_LOG" >&2
+        tail -20 "$PROXY_LOG" >&2 2>/dev/null
+        exit 1
+    fi
+
+    PROXY_PORT="$proxy_port"
 }
 
 show_status() {
@@ -142,6 +207,8 @@ show_help() {
     echo "  --cost                               Pricing comparison"
     echo "  --benchmark                          Latency test"
     echo "  -s, --switch <backend>               Switch proxy mid-session"
+    echo "  --install-statusline                 Add Claude Code statusLine showing"
+    echo "                                       routing + cumulative cost (requires jq)"
     echo "  -h, --help                           This help"
     echo ""
     echo "Environment variables:"
@@ -149,6 +216,39 @@ show_help() {
     echo "  OPENROUTER_API_KEY    OpenRouter API key (required for or)"
     echo "  FIREWORKS_API_KEY     Fireworks API key (required for fw)"
     echo "  CHEAPCLAUDE_DEFAULT_BACKEND  Default backend (default: ds)"
+}
+
+do_install_statusline() {
+    if ! command -v jq >/dev/null 2>&1; then
+        echo "ERROR: jq is required to merge ~/.claude/settings.json" >&2
+        echo "  Install with: brew install jq  (or your platform equivalent)" >&2
+        exit 1
+    fi
+
+    local script_path="$SCRIPT_DIR/bin/deepclaude-statusline"
+    if [[ ! -x "$script_path" ]]; then
+        echo "ERROR: $script_path not found or not executable" >&2
+        exit 1
+    fi
+
+    local settings_dir="$HOME/.claude"
+    local settings_file="$settings_dir/settings.json"
+    mkdir -p "$settings_dir"
+    if [[ ! -f "$settings_file" ]]; then
+        echo '{}' > "$settings_file"
+    fi
+
+    local tmp
+    tmp=$(mktemp)
+    # Merge into existing settings.json (preserves any other keys the user
+    # has set, e.g. permissions, hooks).
+    jq --arg cmd "$script_path" \
+        '. + {statusLine: {type: "command", command: $cmd}}' \
+        "$settings_file" > "$tmp"
+    mv "$tmp" "$settings_file"
+
+    echo "  Installed statusLine: $script_path"
+    echo "  ~/.claude/settings.json updated. Restart Claude Code to see the new line."
 }
 
 do_switch() {
@@ -207,17 +307,20 @@ launch_claude() {
 
     resolve_backend
 
+    echo "  Starting model proxy for $BACKEND..."
+    start_proxy
+    echo "  Proxy log: $PROXY_LOG"
+
     echo "  Launching Claude Code via $BACKEND..."
-    echo "  Endpoint: $RESOLVED_URL"
+    echo "  Proxy on :$PROXY_PORT -> $RESOLVED_URL"
     echo "  Model: $RESOLVED_OPUS (main) + $RESOLVED_HAIKU (subagents)"
     echo ""
 
-    export ANTHROPIC_BASE_URL="$RESOLVED_URL"
-    export ANTHROPIC_AUTH_TOKEN="$RESOLVED_KEY"
+    export ANTHROPIC_BASE_URL="http://127.0.0.1:$PROXY_PORT"
     set_model_env
-    unset ANTHROPIC_API_KEY
 
-    exec claude "$@"
+    # Don't `exec` — the EXIT trap needs to fire to stop the proxy.
+    claude "$@"
 }
 
 launch_remote() {
@@ -268,11 +371,12 @@ launch_remote() {
 
 # --- Main ---
 case "$ACTION" in
-    status)    show_status ;;
-    cost)      show_cost ;;
-    benchmark) run_benchmark ;;
-    help)      show_help ;;
-    switch)    do_switch ;;
-    remote)    launch_remote "$@" ;;
+    status)             show_status ;;
+    cost)               show_cost ;;
+    benchmark)          run_benchmark ;;
+    help)               show_help ;;
+    switch)             do_switch ;;
+    install-statusline) do_install_statusline ;;
+    remote)             launch_remote "$@" ;;
     launch)    launch_claude "$@" ;;
 esac
