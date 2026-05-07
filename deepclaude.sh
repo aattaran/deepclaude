@@ -109,15 +109,19 @@ backend_long_name() {
     esac
 }
 
-# Starts proxy/start-proxy.js in the background, waits for it to print its
-# port (a bare numeric line), sets the global PROXY_PID, and echoes the port
-# to stdout. Ongoing proxy logs go to PROXY_LOG (default /tmp/deepclaude-proxy.log).
+# Starts proxy/start-proxy.js in the background and waits for it to bind a
+# port. Sets PROXY_PID, PROXY_PORT, and PROXY_LOG as script globals so the
+# EXIT trap (cleanup_proxy) can see the pid. Must be called WITHOUT command
+# substitution — $(start_proxy) would run in a subshell and the globals
+# would never reach the parent.
+# PROXY_LOG defaults to /tmp/deepclaude-proxy.$$.log so concurrent invocations
+# don't truncate each other's logs; override with PROXY_LOG=<path>.
 # Requires: RESOLVED_URL, RESOLVED_KEY, BACKEND already set (call resolve_backend first).
 start_proxy() {
     local backend_long
     backend_long=$(backend_long_name "$BACKEND") || exit 1
 
-    PROXY_LOG="${PROXY_LOG:-/tmp/deepclaude-proxy.log}"
+    PROXY_LOG="${PROXY_LOG:-/tmp/deepclaude-proxy.$$.log}"
     : > "$PROXY_LOG"
     node "$SCRIPT_DIR/proxy/start-proxy.js" "$RESOLVED_URL" "$RESOLVED_KEY" "$backend_long" >> "$PROXY_LOG" 2>&1 &
     PROXY_PID=$!
@@ -147,7 +151,7 @@ start_proxy() {
         exit 1
     fi
 
-    echo "$proxy_port"
+    PROXY_PORT="$proxy_port"
 }
 
 show_status() {
@@ -273,17 +277,20 @@ launch_claude() {
     resolve_backend
 
     echo "  Starting model proxy for $BACKEND..."
-    local proxy_port
-    proxy_port=$(start_proxy)
+    # Call directly (not via $()): start_proxy sets PROXY_PID/PROXY_PORT/PROXY_LOG
+    # as script globals, which a subshell would never propagate to the parent
+    # — the EXIT trap needs PROXY_PID to actually clean up the node process.
+    start_proxy
+    echo "  Proxy log: $PROXY_LOG"
 
     echo "  Launching Claude Code via $BACKEND..."
-    echo "  Proxy on :$proxy_port -> $RESOLVED_URL"
+    echo "  Proxy on :$PROXY_PORT -> $RESOLVED_URL"
     echo "  Model: $RESOLVED_OPUS (main) + $RESOLVED_HAIKU (subagents)"
     echo ""
 
     # Route through local proxy so the model name remap fires and Claude Code
     # sees a Claude model (unlocking auto-mode and bypassPermissions).
-    export ANTHROPIC_BASE_URL="http://127.0.0.1:$proxy_port"
+    export ANTHROPIC_BASE_URL="http://127.0.0.1:$PROXY_PORT"
     set_model_env
     # Proxy injects auth itself; the client must not also send credentials.
     unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
@@ -305,14 +312,14 @@ launch_remote() {
     resolve_backend
 
     echo "  Starting model proxy for $BACKEND..."
-    local proxy_port
-    proxy_port=$(start_proxy)
+    start_proxy
+    echo "  Proxy log: $PROXY_LOG"
 
-    echo "  Proxy on :$proxy_port -> $RESOLVED_URL"
+    echo "  Proxy on :$PROXY_PORT -> $RESOLVED_URL"
     echo "  Launching remote control via $BACKEND..."
     echo ""
 
-    export ANTHROPIC_BASE_URL="http://127.0.0.1:$proxy_port"
+    export ANTHROPIC_BASE_URL="http://127.0.0.1:$PROXY_PORT"
     set_model_env
     unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
 
