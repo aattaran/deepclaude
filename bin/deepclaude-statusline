@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# Claude Code statusLine for deepclaude. Reads Claude Code's status JSON
+# from stdin, polls the local proxy for routing + cumulative cost, and
+# emits a one-line summary like:
+#
+#   [claude-opus-4-7 → deepseek-v4-pro on api.deepseek.com] · ↑5.2K ↓1.1K · $0.04 (saved $0.13)
+#
+# Auto-installed by deepclaude on launch via ensure_statusline_installed.
+# Requires jq.
+
+set -uo pipefail
+
+PROXY_PORT="${DEEPCLAUDE_PROXY_PORT:-3200}"
+TIMEOUT="${DEEPCLAUDE_STATUSLINE_TIMEOUT:-1}"
+
+input=""
+if [[ -t 0 ]]; then
+    input="{}"
+else
+    input=$(cat 2>/dev/null || echo "{}")
+fi
+
+if ! command -v jq >/dev/null 2>&1; then
+    echo "[deepclaude statusline: jq not installed]"
+    exit 0
+fi
+
+claude_model=$(echo "$input" | jq -r '.model.id // .model.display_name // empty' 2>/dev/null)
+
+status=$(curl -s --max-time "$TIMEOUT" "http://127.0.0.1:${PROXY_PORT}/_proxy/status" 2>/dev/null || echo "{}")
+cost=$(curl -s --max-time "$TIMEOUT" "http://127.0.0.1:${PROXY_PORT}/_proxy/cost" 2>/dev/null || echo "{}")
+
+if [[ "$status" == "{}" ]]; then
+    echo "[deepclaude proxy not reachable on :${PROXY_PORT}]"
+    exit 0
+fi
+
+backend_host=$(echo "$status" | jq -r '.backend_host // "?"')
+
+# Prefer the model Claude Code passes on stdin — that's the *main*
+# conversation model, stable across the haiku/flash subagent calls
+# Claude Code makes for things like topic detection. Falling back to
+# last_request would make the statusline flicker to the most recent
+# subagent call.
+display_model="${claude_model}"
+if [[ -z "$display_model" ]]; then
+    display_model=$(echo "$status" | jq -r '.last_request.client_model // empty')
+fi
+
+# Wire-side mapping for whatever the display model is, looked up from
+# the proxy's MODEL_REMAP[state.mode]. Empty if no mapping (default
+# mode where env=wire, so display_model is already the backend name).
+display_wire=""
+if [[ -n "$display_model" ]]; then
+    display_wire=$(echo "$status" | jq -r --arg m "$display_model" '.model_remap[$m] // empty')
+fi
+[[ -z "$display_wire" ]] && display_wire="$display_model"
+
+display_dest=$(echo "$status" | jq -r '.last_request.destination // empty')
+[[ -z "$display_dest" ]] && display_dest="$backend_host"
+
+input_tokens=$(echo "$cost" | jq -r '.total_input_tokens // 0' 2>/dev/null)
+output_tokens=$(echo "$cost" | jq -r '.total_output_tokens // 0' 2>/dev/null)
+total_cost=$(echo "$cost" | jq -r '.total_cost // 0' 2>/dev/null)
+savings=$(echo "$cost" | jq -r '.savings // 0' 2>/dev/null)
+anthropic_eq=$(echo "$cost" | jq -r '.anthropic_equivalent // 0' 2>/dev/null)
+
+# 12345 → 12.3K, 1234567 → 1.2M
+fmt_tokens() {
+    awk -v t="$1" 'BEGIN {
+        if (t >= 1000000) printf "%.1fM", t/1000000;
+        else if (t >= 1000) printf "%.1fK", t/1000;
+        else printf "%d", t;
+    }'
+}
+input_fmt=$(fmt_tokens "$input_tokens")
+output_fmt=$(fmt_tokens "$output_tokens")
+cost_fmt=$(awk -v c="$total_cost" 'BEGIN { printf "$%.2f", c }')
+
+# Show savings tail only when we'd round to >= $0.01. Percent is savings
+# as a fraction of what Anthropic would have charged.
+savings_part=""
+if awk -v s="$savings" 'BEGIN { exit !(s >= 0.005) }'; then
+    savings_part=$(awk -v s="$savings" -v a="$anthropic_eq" 'BEGIN {
+        pct = (a > 0) ? (s / a) * 100 : 0;
+        printf " (saved $%.2f, %.0f%%)", s, pct;
+    }')
+fi
+
+if [[ -n "$display_model" && "$display_model" != "$display_wire" ]]; then
+    model_part="[$display_model → $display_wire on $display_dest]"
+elif [[ -n "$display_model" ]]; then
+    model_part="[$display_model on $display_dest]"
+else
+    model_part="[deepclaude on $display_dest]"
+fi
+
+# Trailing blank line gives a one-row gap below the status line. Closest a
+# shell statusLine command can get to bottom padding.
+printf '%s\n\n' "${model_part} · ↑${input_fmt} ↓${output_fmt} · ${cost_fmt}${savings_part}"

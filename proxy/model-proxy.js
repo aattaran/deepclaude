@@ -146,6 +146,9 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
             apiKey: startBackend ? startBackend.apiKey : apiKey,
             useBearer: startBackend ? startBackend.useBearer : initialBearer,
             hadNonAnthropicSession: !!startBackend,
+            // Last /v1/messages we forwarded; surfaced via /_proxy/status so a
+            // statusLine integration can show client → wire mapping live.
+            lastRequest: null,
         };
 
         let reqCount = 0;
@@ -163,6 +166,8 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
             const summary = {};
             let totalActual = 0;
             let totalAnthropic = 0;
+            let totalInput = 0;
+            let totalOutput = 0;
             for (const [backend, tokens] of Object.entries(costs)) {
                 const p = PRICING_PER_M[backend] || PRICING_PER_M._single;
                 const ap = PRICING_PER_M.anthropic;
@@ -170,6 +175,8 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                 const anthropicEq = (tokens.input * ap.input + tokens.output * ap.output) / 1_000_000;
                 totalActual += actual;
                 totalAnthropic += anthropicEq;
+                totalInput += tokens.input;
+                totalOutput += tokens.output;
                 summary[backend] = {
                     input_tokens: tokens.input,
                     output_tokens: tokens.output,
@@ -180,6 +187,8 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
             }
             return {
                 backends: summary,
+                total_input_tokens: totalInput,
+                total_output_tokens: totalOutput,
                 total_cost: +totalActual.toFixed(4),
                 anthropic_equivalent: +totalAnthropic.toFixed(4),
                 savings: +((totalAnthropic - totalActual).toFixed(4)),
@@ -216,8 +225,14 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                     clientRes.writeHead(200, { 'content-type': 'application/json' });
                     clientRes.end(JSON.stringify({
                         mode: state.mode,
+                        backend_host: state.target.hostname,
                         uptime: Math.round((Date.now() - t0Global) / 1000),
                         requests: reqCount,
+                        last_request: state.lastRequest,
+                        // Statusline looks up the wire-side mapping for whatever
+                        // model Claude Code says it's using (via stdin), without
+                        // having to duplicate the table in shell.
+                        model_remap: MODEL_REMAP[state.mode] || {},
                     }));
                     return;
                 }
@@ -315,17 +330,33 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
             clientReq.on('end', () => {
                 let body = Buffer.concat(chunks);
 
-                // Remap Anthropic model names to backend-specific names
-                if (isModelCall && MODEL_REMAP[state.mode]) {
+                // Remap Anthropic model names to backend-specific names, and
+                // capture client → wire mapping for /_proxy/status.
+                let clientModel = null;
+                let wireModel = null;
+                if (MODEL_PATHS.includes(urlPath)) {
                     try {
                         const parsed = JSON.parse(body);
-                        const mapped = MODEL_REMAP[state.mode][parsed.model];
-                        if (mapped) {
-                            console.log(`[MODEL-PROXY] #${reqId} model remap: ${parsed.model} → ${mapped}`);
-                            parsed.model = mapped;
-                            body = Buffer.from(JSON.stringify(parsed));
+                        clientModel = parsed.model || null;
+                        wireModel = clientModel;
+                        if (isModelCall && MODEL_REMAP[state.mode]) {
+                            const mapped = MODEL_REMAP[state.mode][parsed.model];
+                            if (mapped) {
+                                console.log(`[MODEL-PROXY] #${reqId} model remap: ${parsed.model} → ${mapped}`);
+                                parsed.model = mapped;
+                                wireModel = mapped;
+                                body = Buffer.from(JSON.stringify(parsed));
+                            }
                         }
                     } catch { /* not JSON or parse error, pass through */ }
+                    if (clientModel) {
+                        state.lastRequest = {
+                            client_model: clientModel,
+                            wire_model: wireModel,
+                            destination: dest.hostname,
+                            timestamp: Date.now(),
+                        };
+                    }
                 }
 
                 // Strip thinking blocks before forwarding.
@@ -348,7 +379,16 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                 if (isModelCall) {
                     try {
                         const parsed = JSON.parse(body);
-                        stripAllThinkingBlocks(parsed);
+                        // DeepSeek's anthropic-compat endpoint expects its own
+                        // thinking blocks passed back verbatim for continuity
+                        // ("content[].thinking ... must be passed back"), so
+                        // we don't strip thinking blocks here. Top-level
+                        // thinking/context_management still go — non-Anthropic
+                        // backends don't honor Anthropic's extended-thinking
+                        // spec consistently, and a stale config field is a
+                        // noisier error than no config at all.
+                        delete parsed.thinking;
+                        delete parsed.context_management;
                         body = Buffer.from(JSON.stringify(parsed));
                     } catch { /* pass through */ }
                 }
