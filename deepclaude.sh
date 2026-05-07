@@ -266,6 +266,20 @@ run_benchmark() {
     echo ""
 }
 
+# Run claude and surface the tail of $PROXY_LOG if it exits abnormally.
+# Skips signal-induced exits (>=128, e.g. 130 SIGINT, 143 SIGTERM) so
+# Ctrl+C doesn't dump a noisy log on intentional quit.
+run_claude_with_log_tail() {
+    local exit_code=0
+    "$@" || exit_code=$?
+    if [[ $exit_code -ne 0 && $exit_code -lt 128 ]]; then
+        echo "" >&2
+        echo "  claude exited with status $exit_code. Last 20 lines of $PROXY_LOG:" >&2
+        tail -20 "$PROXY_LOG" >&2 2>/dev/null || true
+    fi
+    return $exit_code
+}
+
 launch_claude() {
     if [[ "$BACKEND" == "anthropic" ]]; then
         echo "  Launching Claude Code (normal Anthropic backend)..."
@@ -298,7 +312,7 @@ launch_claude() {
     unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
 
     # Don't exec — we want the EXIT trap to clean up the proxy.
-    claude "$@"
+    run_claude_with_log_tail claude "$@"
 }
 
 launch_remote() {
@@ -325,7 +339,7 @@ launch_remote() {
     set_model_env
     unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
 
-    claude remote-control "$@"
+    run_claude_with_log_tail claude remote-control "$@"
 }
 
 # --- Main ---
