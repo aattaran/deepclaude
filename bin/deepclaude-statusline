@@ -83,4 +83,6 @@ else
     model_part="[deepclaude on $display_dest]"
 fi
 
-echo "${model_part} · ↑${input_fmt} ↓${output_fmt} · ${cost_fmt}${savings_part}"
+# Trailing blank line gives a one-row gap below the status line. Closest a
+# shell statusLine command can get to bottom padding.
+printf '%s\n\n' "${model_part} · ↑${input_fmt} ↓${output_fmt} · ${cost_fmt}${savings_part}"
