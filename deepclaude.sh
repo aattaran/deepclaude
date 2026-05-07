@@ -4,7 +4,17 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Resolve SCRIPT_DIR through any symlink chain (e.g. /usr/local/bin/deepclaude
+# -> /path/to/repo/deepclaude.sh) so $SCRIPT_DIR/proxy/... works regardless of
+# how the script was invoked.
+_source="${BASH_SOURCE[0]}"
+while [ -L "$_source" ]; do
+    _dir="$(cd "$(dirname "$_source")" && pwd)"
+    _source="$(readlink "$_source")"
+    [[ "$_source" != /* ]] && _source="$_dir/$_source"
+done
+SCRIPT_DIR="$(cd "$(dirname "$_source")" && pwd)"
+unset _source _dir
 
 # --- Config ---
 DEEPSEEK_URL="https://api.deepseek.com/anthropic"
@@ -83,6 +93,60 @@ set_model_env() {
     export ANTHROPIC_DEFAULT_HAIKU_MODEL="$RESOLVED_HAIKU"
     export CLAUDE_CODE_SUBAGENT_MODEL="$RESOLVED_SUBAGENT"
     export CLAUDE_CODE_EFFORT_LEVEL="max"
+}
+
+backend_long_name() {
+    case "$1" in
+        ds|deepseek)   echo "deepseek" ;;
+        or|openrouter) echo "openrouter" ;;
+        fw|fireworks)  echo "fireworks" ;;
+        anthropic)     echo "anthropic" ;;
+        *) echo "ERROR: Unknown backend '$1'. Use: ds, or, fw, anthropic" >&2; return 1 ;;
+    esac
+}
+
+# Sets PROXY_PID, PROXY_PORT, PROXY_LOG as script globals so the EXIT trap
+# can clean up the node child. Must be called WITHOUT command substitution
+# — $(start_proxy) runs in a subshell and globals never reach the parent.
+# Requires: RESOLVED_URL, RESOLVED_KEY, BACKEND already set.
+start_proxy() {
+    local backend_long
+    backend_long=$(backend_long_name "$BACKEND") || exit 1
+
+    PROXY_LOG="${PROXY_LOG:-/tmp/deepclaude-proxy.$$.log}"
+    : > "$PROXY_LOG"
+    node "$SCRIPT_DIR/proxy/start-proxy.js" "$RESOLVED_URL" "$RESOLVED_KEY" "$backend_long" >> "$PROXY_LOG" 2>&1 &
+    PROXY_PID=$!
+
+    # The proxy emits a banner line, then a bare-numeric port line on a
+    # successful bind. Match the bare integer to skip the banner; do not
+    # introduce other numeric-only stdout in proxy startup.
+    local proxy_port=""
+    local tries=0
+    while [[ -z "$proxy_port" ]] && [[ $tries -lt 30 ]]; do
+        if kill -0 "$PROXY_PID" 2>/dev/null; then
+            # `|| true`: with `set -o pipefail`, grep no-match (exit 1)
+            # would otherwise exit the script; we expect zero matches on
+            # early iterations before the proxy has emitted its port.
+            proxy_port=$(grep -E '^[0-9]+$' "$PROXY_LOG" 2>/dev/null | head -1 || true)
+        else
+            echo "ERROR: Proxy process died during startup" >&2
+            echo "  Log: $PROXY_LOG" >&2
+            tail -20 "$PROXY_LOG" >&2 2>/dev/null
+            exit 1
+        fi
+        [[ -z "$proxy_port" ]] && sleep 0.2
+        tries=$((tries + 1))
+    done
+
+    if [[ -z "$proxy_port" ]]; then
+        echo "ERROR: Proxy failed to report a port within 6s" >&2
+        echo "  Log: $PROXY_LOG" >&2
+        tail -20 "$PROXY_LOG" >&2 2>/dev/null
+        exit 1
+    fi
+
+    PROXY_PORT="$proxy_port"
 }
 
 show_status() {
@@ -207,17 +271,23 @@ launch_claude() {
 
     resolve_backend
 
+    echo "  Starting model proxy for $BACKEND..."
+    start_proxy
+    echo "  Proxy log: $PROXY_LOG"
+
     echo "  Launching Claude Code via $BACKEND..."
-    echo "  Endpoint: $RESOLVED_URL"
+    echo "  Proxy on :$PROXY_PORT -> $RESOLVED_URL"
     echo "  Model: $RESOLVED_OPUS (main) + $RESOLVED_HAIKU (subagents)"
     echo ""
 
-    export ANTHROPIC_BASE_URL="$RESOLVED_URL"
-    export ANTHROPIC_AUTH_TOKEN="$RESOLVED_KEY"
+    export ANTHROPIC_BASE_URL="http://127.0.0.1:$PROXY_PORT"
     set_model_env
-    unset ANTHROPIC_API_KEY
+    # Deliberately do not unset ANTHROPIC_AUTH_TOKEN — whatever Claude Code
+    # is carrying is what authenticates at Anthropic on the image-reroute
+    # path; the proxy injects backend auth for non-image turns separately.
 
-    exec claude "$@"
+    # Don't `exec` — the EXIT trap needs to fire to stop the proxy.
+    claude "$@"
 }
 
 launch_remote() {
