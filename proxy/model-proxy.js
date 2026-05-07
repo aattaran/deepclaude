@@ -25,9 +25,7 @@ const MODEL_REMAP = {
     },
 };
 
-// Many-to-one collisions in MODEL_REMAP collapse last-write-wins — so
-// `deepseek-v4-pro` reverses to `claude-opus-4-7` (the most recent key),
-// not `claude-opus-4-6`. That's the right default.
+// Many-to-one collisions in MODEL_REMAP collapse last-write-wins.
 const REVERSE_MODEL_REMAP = {};
 for (const [backend, table] of Object.entries(MODEL_REMAP)) {
     REVERSE_MODEL_REMAP[backend] = {};
@@ -146,9 +144,8 @@ function stripUnsignedThinkingBlocks(body) {
     }
 }
 
-// True if any message contains an `image` content block, including nested
-// inside `tool_result` content arrays (Claude Code's Read tool wraps a
-// returned PNG in tool_result.content rather than at the top level).
+// Recurses into tool_result.content[] because Claude Code's Read tool
+// wraps a returned PNG there rather than at the top of the message.
 function containsImageBlock(messages) {
     if (!Array.isArray(messages)) return false;
     const blockHasImage = (block) => {
@@ -164,6 +161,32 @@ function containsImageBlock(messages) {
         if (msg.content.some(blockHasImage)) return true;
     }
     return false;
+}
+
+// Replaces image blocks with a text placeholder, recursing into
+// tool_result.content[]. Used on non-Anthropic routes so a single image
+// turn earlier in history doesn't pin the rest of the conversation to
+// Anthropic — which would silently spend Max quota while the TUI still
+// shows the cheap backend. Returns the count of images replaced.
+function stripImagesFromMessages(messages) {
+    if (!Array.isArray(messages)) return 0;
+    let count = 0;
+    const strip = (block) => {
+        if (!block) return block;
+        if (block.type === 'image') {
+            count++;
+            return { type: 'text', text: '[image omitted]' };
+        }
+        if (block.type === 'tool_result' && Array.isArray(block.content)) {
+            return { ...block, content: block.content.map(strip) };
+        }
+        return block;
+    };
+    for (const msg of messages) {
+        if (!Array.isArray(msg.content)) continue;
+        msg.content = msg.content.map(strip);
+    }
+    return count;
 }
 
 export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends, defaultMode }) {
@@ -331,11 +354,17 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                     try { parsed = JSON.parse(body); } catch {}
                 }
 
+                // Only the LATEST message triggers the Anthropic reroute
+                // (a fresh attachment, or a Read tool_result that just came
+                // back). Stale images in older history are stripped below
+                // so the conversation can return to the backend on text-only
+                // follow-ups instead of silently pinning to Max quota.
+                const lastMsg = parsed?.messages?.[parsed.messages.length - 1];
                 const forceAnthropicForImage = (
                     IMAGE_FALLBACK_ENABLED &&
                     state.mode !== 'anthropic' &&
-                    parsed &&
-                    containsImageBlock(parsed.messages)
+                    !!lastMsg &&
+                    containsImageBlock([lastMsg])
                 );
 
                 const isAnthropicMode = state.mode === 'anthropic' || forceAnthropicForImage;
@@ -406,6 +435,18 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                         delete parsed.context_management;
                         if (imageRewrite) {
                             parsed.model = imageRewrite.canonical;
+                        }
+                    }
+
+                    // Strip stale images from history on non-Anthropic
+                    // routes. Without this, every text follow-up on an
+                    // image-bearing conversation would still detect the
+                    // image and re-route to Anthropic — burning Max quota
+                    // while the TUI advertises the cheap backend.
+                    if (isModelCall) {
+                        const stripped = stripImagesFromMessages(parsed.messages);
+                        if (stripped > 0) {
+                            console.log(`[MODEL-PROXY] #${reqId} stripped ${stripped} stale image block${stripped === 1 ? '' : 's'} from history`);
                         }
                     }
 
