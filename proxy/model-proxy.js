@@ -368,6 +368,20 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                         console.log(`[MODEL-PROXY] #${reqId} TTFB ${ttfb}ms (status ${proxyRes.statusCode})`);
                     }
 
+                    // Without this, an upstream stream error (connection reset
+                    // mid-response) emits an unhandled 'error' on proxyRes and
+                    // crashes the proxy process.
+                    proxyRes.on('error', (err) => {
+                        const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+                        console.error(`[MODEL-PROXY] #${reqId} upstream stream error after ${elapsed}s: ${err.message}`);
+                        if (!clientRes.headersSent) {
+                            clientRes.writeHead(502, { 'content-type': 'application/json' });
+                            clientRes.end(JSON.stringify({ error: { message: 'Upstream stream error' } }));
+                        } else {
+                            clientRes.destroy(err);
+                        }
+                    });
+
                     const ct = proxyRes.headers['content-type'] || '';
                     const isSSE = ct.includes('text/event-stream');
 
@@ -415,8 +429,14 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                     console.error(`[MODEL-PROXY] #${reqId} ERROR after ${elapsed}s: ${err.message}`);
                     if (!clientRes.headersSent) {
                         clientRes.writeHead(502, { 'content-type': 'application/json' });
+                        clientRes.end(JSON.stringify({ error: { message: 'Upstream connection error' } }));
+                    } else {
+                        // Headers already sent (likely mid-SSE) — emitting JSON
+                        // here would inject a non-event into the event-stream and
+                        // break the client parser. Terminate the response so the
+                        // client sees a clean transport error instead.
+                        clientRes.destroy(err);
                     }
-                    clientRes.end(JSON.stringify({ error: { message: 'Upstream connection error' } }));
                 });
 
                 proxyReq.end(body);
