@@ -3,13 +3,9 @@
 # from stdin, polls the local proxy for routing + cumulative cost, and
 # emits a one-line summary like:
 #
-#   [claude-opus-4-7 → deepseek-v4-pro on api.deepseek.com] · 12.3K tokens · $0.04
+#   [claude-opus-4-7 → deepseek-v4-pro on api.deepseek.com] · ↑5.2K ↓1.1K · $0.04 (saved $0.13)
 #
-# Install via `deepclaude --install-statusline` or by adding to
-# ~/.claude/settings.json:
-#
-#   { "statusLine": { "type": "command", "command": "/abs/path/to/deepclaude-statusline" } }
-#
+# Auto-installed by deepclaude on launch via ensure_statusline_installed.
 # Requires jq.
 
 set -uo pipefail
@@ -17,8 +13,6 @@ set -uo pipefail
 PROXY_PORT="${DEEPCLAUDE_PROXY_PORT:-3200}"
 TIMEOUT="${DEEPCLAUDE_STATUSLINE_TIMEOUT:-1}"
 
-# Claude Code passes JSON on stdin. Best-effort read; falls through if
-# stdin is empty or not JSON.
 input=""
 if [[ -t 0 ]]; then
     input="{}"
@@ -46,10 +40,10 @@ last_client=$(echo "$status" | jq -r '.last_request.client_model // empty')
 last_wire=$(echo "$status" | jq -r '.last_request.wire_model // empty')
 last_dest=$(echo "$status" | jq -r '.last_request.destination // empty')
 
-# Sum tokens across all backend buckets; fall back to 0 if cost endpoint
-# returned nothing.
-total_tokens=$(echo "$cost" | jq '[.backends // {} | to_entries[] | (.value.input_tokens + .value.output_tokens)] | add // 0' 2>/dev/null)
+input_tokens=$(echo "$cost" | jq -r '.total_input_tokens // 0' 2>/dev/null)
+output_tokens=$(echo "$cost" | jq -r '.total_output_tokens // 0' 2>/dev/null)
 total_cost=$(echo "$cost" | jq -r '.total_cost // 0' 2>/dev/null)
+savings=$(echo "$cost" | jq -r '.savings // 0' 2>/dev/null)
 
 # 12345 → 12.3K, 1234567 → 1.2M
 fmt_tokens() {
@@ -59,8 +53,16 @@ fmt_tokens() {
         else printf "%d", t;
     }'
 }
-tokens_fmt=$(fmt_tokens "$total_tokens")
+input_fmt=$(fmt_tokens "$input_tokens")
+output_fmt=$(fmt_tokens "$output_tokens")
 cost_fmt=$(awk -v c="$total_cost" 'BEGIN { printf "$%.2f", c }')
+
+# Show savings tail only when we'd round to >= $0.01.
+savings_part=""
+if awk -v s="$savings" 'BEGIN { exit !(s >= 0.005) }'; then
+    savings_fmt=$(awk -v s="$savings" 'BEGIN { printf "$%.2f", s }')
+    savings_part=" (saved ${savings_fmt})"
+fi
 
 # Compose the model display. Prefer last_request data (most accurate
 # client → wire). Fall back to claude_model from stdin if proxy hasn't
@@ -70,9 +72,11 @@ display_wire="${last_wire:-$display_model}"
 display_dest="${last_dest:-$backend_host}"
 
 if [[ -n "$display_model" && "$display_model" != "$display_wire" ]]; then
-    echo "[$display_model → $display_wire on $display_dest] · $tokens_fmt tokens · $cost_fmt"
+    model_part="[$display_model → $display_wire on $display_dest]"
 elif [[ -n "$display_model" ]]; then
-    echo "[$display_model on $display_dest] · $tokens_fmt tokens · $cost_fmt"
+    model_part="[$display_model on $display_dest]"
 else
-    echo "[deepclaude on $display_dest] · $tokens_fmt tokens · $cost_fmt"
+    model_part="[deepclaude on $display_dest]"
 fi
+
+echo "${model_part} · ↑${input_fmt} ↓${output_fmt} · ${cost_fmt}${savings_part}"

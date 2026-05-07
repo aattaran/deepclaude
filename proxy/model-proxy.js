@@ -166,6 +166,8 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
             const summary = {};
             let totalActual = 0;
             let totalAnthropic = 0;
+            let totalInput = 0;
+            let totalOutput = 0;
             for (const [backend, tokens] of Object.entries(costs)) {
                 const p = PRICING_PER_M[backend] || PRICING_PER_M._single;
                 const ap = PRICING_PER_M.anthropic;
@@ -173,6 +175,8 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                 const anthropicEq = (tokens.input * ap.input + tokens.output * ap.output) / 1_000_000;
                 totalActual += actual;
                 totalAnthropic += anthropicEq;
+                totalInput += tokens.input;
+                totalOutput += tokens.output;
                 summary[backend] = {
                     input_tokens: tokens.input,
                     output_tokens: tokens.output,
@@ -183,6 +187,8 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
             }
             return {
                 backends: summary,
+                total_input_tokens: totalInput,
+                total_output_tokens: totalOutput,
                 total_cost: +totalActual.toFixed(4),
                 anthropic_equivalent: +totalAnthropic.toFixed(4),
                 savings: +((totalAnthropic - totalActual).toFixed(4)),
