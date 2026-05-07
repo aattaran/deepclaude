@@ -60,24 +60,24 @@ resolve_backend() {
             key="${DEEPSEEK_API_KEY:-}"
             [[ -z "$key" ]] && { echo "ERROR: DEEPSEEK_API_KEY not set" >&2; exit 1; }
             url="$DEEPSEEK_URL"
-            opus="deepseek-v4-pro"; sonnet="deepseek-v4-pro"
+            opus="deepseek-v4-pro"; sonnet="deepseek-v4-flash"
             haiku="deepseek-v4-flash"; subagent="deepseek-v4-flash"
             ;;
         or|openrouter)
             key="${OPENROUTER_API_KEY:-}"
             [[ -z "$key" ]] && { echo "ERROR: OPENROUTER_API_KEY not set" >&2; exit 1; }
             url="$OPENROUTER_URL"
-            opus="deepseek/deepseek-v4-pro"; sonnet="deepseek/deepseek-v4-pro"
-            haiku="deepseek/deepseek-v4-pro"; subagent="deepseek/deepseek-v4-pro"
+            opus="deepseek/deepseek-v4-pro"; sonnet="deepseek/deepseek-v4-flash"
+            haiku="deepseek/deepseek-v4-flash"; subagent="deepseek/deepseek-v4-flash"
             ;;
         fw|fireworks)
             key="${FIREWORKS_API_KEY:-}"
             [[ -z "$key" ]] && { echo "ERROR: FIREWORKS_API_KEY not set" >&2; exit 1; }
             url="$FIREWORKS_URL"
             opus="accounts/fireworks/models/deepseek-v4-pro"
-            sonnet="accounts/fireworks/models/deepseek-v4-pro"
-            haiku="accounts/fireworks/models/deepseek-v4-pro"
-            subagent="accounts/fireworks/models/deepseek-v4-pro"
+            sonnet="accounts/fireworks/models/deepseek-v4-flash"
+            haiku="accounts/fireworks/models/deepseek-v4-flash"
+            subagent="accounts/fireworks/models/deepseek-v4-flash"
             ;;
         anthropic) ;;
         *) echo "ERROR: Unknown backend '$BACKEND'. Use: ds, or, fw, anthropic" >&2; exit 1 ;;
