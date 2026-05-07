@@ -25,6 +25,7 @@ BACKEND="${CHEAPCLAUDE_DEFAULT_BACKEND:-ds}"
 ACTION="launch"
 SWITCH_BACKEND=""
 PROXY_PID=""
+AUTO_MODE=0
 
 # --- Parse args ---
 while [[ $# -gt 0 ]]; do
@@ -32,6 +33,7 @@ while [[ $# -gt 0 ]]; do
         --backend|-b) BACKEND="$2"; shift 2 ;;
         --switch|-s)  ACTION="switch"; SWITCH_BACKEND="$2"; shift 2 ;;
         --remote|-r)  ACTION="remote"; shift ;;
+        --auto)       AUTO_MODE=1; shift ;;
         --status)     ACTION="status"; shift ;;
         --cost)       ACTION="cost"; shift ;;
         --benchmark)  ACTION="benchmark"; shift ;;
@@ -88,10 +90,22 @@ resolve_backend() {
 }
 
 set_model_env() {
-    export ANTHROPIC_DEFAULT_OPUS_MODEL="$RESOLVED_OPUS"
-    export ANTHROPIC_DEFAULT_SONNET_MODEL="$RESOLVED_SONNET"
-    export ANTHROPIC_DEFAULT_HAIKU_MODEL="$RESOLVED_HAIKU"
-    export CLAUDE_CODE_SUBAGENT_MODEL="$RESOLVED_SUBAGENT"
+    if [[ "$AUTO_MODE" == "1" ]]; then
+        # Claude Code's auto / bypassPermissions modes are gated on the env
+        # var being a `claude-*` name; the proxy translates back to the
+        # backend name on the wire via MODEL_REMAP. The TUI welcome chip
+        # will display the canonical name — that's the explicit tradeoff
+        # surfaced by print_auto_mode_tip at launch.
+        export ANTHROPIC_DEFAULT_OPUS_MODEL="claude-opus-4-7"
+        export ANTHROPIC_DEFAULT_SONNET_MODEL="claude-sonnet-4-6"
+        export ANTHROPIC_DEFAULT_HAIKU_MODEL="claude-haiku-4-5-20251001"
+        export CLAUDE_CODE_SUBAGENT_MODEL="claude-haiku-4-5-20251001"
+    else
+        export ANTHROPIC_DEFAULT_OPUS_MODEL="$RESOLVED_OPUS"
+        export ANTHROPIC_DEFAULT_SONNET_MODEL="$RESOLVED_SONNET"
+        export ANTHROPIC_DEFAULT_HAIKU_MODEL="$RESOLVED_HAIKU"
+        export CLAUDE_CODE_SUBAGENT_MODEL="$RESOLVED_SUBAGENT"
+    fi
     export CLAUDE_CODE_EFFORT_LEVEL="max"
 }
 
@@ -202,6 +216,8 @@ show_help() {
     echo "Options:"
     echo "  -b, --backend <ds|or|fw|anthropic>  Backend (default: ds)"
     echo "  -r, --remote                        Remote control mode (browser URL)"
+    echo "  --auto                               Unlock auto/bypassPermissions modes"
+    echo "                                       (TUI shows claude-* names; wire still routes to backend)"
     echo "  --status                             Show keys and backends"
     echo "  --cost                               Pricing comparison"
     echo "  --benchmark                          Latency test"
@@ -259,6 +275,18 @@ run_benchmark() {
     echo ""
 }
 
+print_auto_mode_tip() {
+    if [[ "$AUTO_MODE" == "1" ]]; then
+        echo "  Auto mode: ON"
+        echo "    TUI will display 'claude-opus-4-7' (auto/bypassPermissions unlocked)."
+        echo "    Actual routing: $RESOLVED_OPUS via $RESOLVED_URL."
+        echo "    Verify with: curl -s http://127.0.0.1:\$PROXY_PORT/_proxy/cost | jq"
+    else
+        echo "  Auto mode: OFF (TUI shows '$RESOLVED_OPUS')"
+        echo "    Pass --auto to unlock auto/bypassPermissions modes — TUI will then show 'claude-opus-4-7'."
+    fi
+}
+
 launch_claude() {
     if [[ "$BACKEND" == "anthropic" ]]; then
         echo "  Launching Claude Code (normal Anthropic backend)..."
@@ -278,6 +306,7 @@ launch_claude() {
     echo "  Launching Claude Code via $BACKEND..."
     echo "  Proxy on :$PROXY_PORT -> $RESOLVED_URL"
     echo "  Model: $RESOLVED_OPUS (main) + $RESOLVED_HAIKU (subagents)"
+    print_auto_mode_tip
     echo ""
 
     export ANTHROPIC_BASE_URL="http://127.0.0.1:$PROXY_PORT"
@@ -324,6 +353,7 @@ launch_remote() {
 
     echo "  Proxy on :$proxy_port -> $RESOLVED_URL"
     echo "  Launching remote control via $BACKEND..."
+    print_auto_mode_tip
     echo ""
 
     export ANTHROPIC_BASE_URL="http://127.0.0.1:$proxy_port"
