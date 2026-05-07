@@ -146,6 +146,9 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
             apiKey: startBackend ? startBackend.apiKey : apiKey,
             useBearer: startBackend ? startBackend.useBearer : initialBearer,
             hadNonAnthropicSession: !!startBackend,
+            // Last /v1/messages we forwarded; surfaced via /_proxy/status so a
+            // statusLine integration can show client → wire mapping live.
+            lastRequest: null,
         };
 
         let reqCount = 0;
@@ -216,8 +219,10 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                     clientRes.writeHead(200, { 'content-type': 'application/json' });
                     clientRes.end(JSON.stringify({
                         mode: state.mode,
+                        backend_host: state.target.hostname,
                         uptime: Math.round((Date.now() - t0Global) / 1000),
                         requests: reqCount,
+                        last_request: state.lastRequest,
                     }));
                     return;
                 }
@@ -315,17 +320,33 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
             clientReq.on('end', () => {
                 let body = Buffer.concat(chunks);
 
-                // Remap Anthropic model names to backend-specific names
-                if (isModelCall && MODEL_REMAP[state.mode]) {
+                // Remap Anthropic model names to backend-specific names, and
+                // capture client → wire mapping for /_proxy/status.
+                let clientModel = null;
+                let wireModel = null;
+                if (MODEL_PATHS.includes(urlPath)) {
                     try {
                         const parsed = JSON.parse(body);
-                        const mapped = MODEL_REMAP[state.mode][parsed.model];
-                        if (mapped) {
-                            console.log(`[MODEL-PROXY] #${reqId} model remap: ${parsed.model} → ${mapped}`);
-                            parsed.model = mapped;
-                            body = Buffer.from(JSON.stringify(parsed));
+                        clientModel = parsed.model || null;
+                        wireModel = clientModel;
+                        if (isModelCall && MODEL_REMAP[state.mode]) {
+                            const mapped = MODEL_REMAP[state.mode][parsed.model];
+                            if (mapped) {
+                                console.log(`[MODEL-PROXY] #${reqId} model remap: ${parsed.model} → ${mapped}`);
+                                parsed.model = mapped;
+                                wireModel = mapped;
+                                body = Buffer.from(JSON.stringify(parsed));
+                            }
                         }
                     } catch { /* not JSON or parse error, pass through */ }
+                    if (clientModel) {
+                        state.lastRequest = {
+                            client_model: clientModel,
+                            wire_model: wireModel,
+                            destination: dest.hostname,
+                            timestamp: Date.now(),
+                        };
+                    }
                 }
 
                 // Strip thinking blocks before forwarding.
