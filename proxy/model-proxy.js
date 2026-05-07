@@ -229,6 +229,10 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                         uptime: Math.round((Date.now() - t0Global) / 1000),
                         requests: reqCount,
                         last_request: state.lastRequest,
+                        // Statusline looks up the wire-side mapping for whatever
+                        // model Claude Code says it's using (via stdin), without
+                        // having to duplicate the table in shell.
+                        model_remap: MODEL_REMAP[state.mode] || {},
                     }));
                     return;
                 }

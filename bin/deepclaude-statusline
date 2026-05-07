@@ -36,9 +36,28 @@ if [[ "$status" == "{}" ]]; then
 fi
 
 backend_host=$(echo "$status" | jq -r '.backend_host // "?"')
-last_client=$(echo "$status" | jq -r '.last_request.client_model // empty')
-last_wire=$(echo "$status" | jq -r '.last_request.wire_model // empty')
-last_dest=$(echo "$status" | jq -r '.last_request.destination // empty')
+
+# Prefer the model Claude Code passes on stdin — that's the *main*
+# conversation model, stable across the haiku/flash subagent calls
+# Claude Code makes for things like topic detection. Falling back to
+# last_request would make the statusline flicker to the most recent
+# subagent call.
+display_model="${claude_model}"
+if [[ -z "$display_model" ]]; then
+    display_model=$(echo "$status" | jq -r '.last_request.client_model // empty')
+fi
+
+# Wire-side mapping for whatever the display model is, looked up from
+# the proxy's MODEL_REMAP[state.mode]. Empty if no mapping (default
+# mode where env=wire, so display_model is already the backend name).
+display_wire=""
+if [[ -n "$display_model" ]]; then
+    display_wire=$(echo "$status" | jq -r --arg m "$display_model" '.model_remap[$m] // empty')
+fi
+[[ -z "$display_wire" ]] && display_wire="$display_model"
+
+display_dest=$(echo "$status" | jq -r '.last_request.destination // empty')
+[[ -z "$display_dest" ]] && display_dest="$backend_host"
 
 input_tokens=$(echo "$cost" | jq -r '.total_input_tokens // 0' 2>/dev/null)
 output_tokens=$(echo "$cost" | jq -r '.total_output_tokens // 0' 2>/dev/null)
@@ -67,13 +86,6 @@ if awk -v s="$savings" 'BEGIN { exit !(s >= 0.005) }'; then
         printf " (saved $%.2f, %.0f%%)", s, pct;
     }')
 fi
-
-# Compose the model display. Prefer last_request data (most accurate
-# client → wire). Fall back to claude_model from stdin if proxy hasn't
-# seen a request yet.
-display_model="${last_client:-$claude_model}"
-display_wire="${last_wire:-$display_model}"
-display_dest="${last_dest:-$backend_host}"
 
 if [[ -n "$display_model" && "$display_model" != "$display_wire" ]]; then
     model_part="[$display_model → $display_wire on $display_dest]"
