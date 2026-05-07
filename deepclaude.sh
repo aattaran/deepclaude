@@ -131,6 +131,12 @@ start_proxy() {
     # Wait for a line that is a bare integer (the port emitted by start-proxy.js
     # after startModelProxy resolves). The proxy also writes a human-readable
     # "[MODEL-PROXY] Listening on ..." banner first, so we can't just read line 1.
+    #
+    # Banner-ordering invariant: start-proxy.js emits the "[MODEL-PROXY]
+    # Listening on ..." banner (from the listen callback inside startModelProxy)
+    # BEFORE its final `console.log(port)`. We match the bare-numeric line to
+    # skip the banner — do not introduce other numeric-only stdout in proxy
+    # startup or this regex will pick the wrong line.
     local proxy_port=""
     local tries=0
     while [[ -z "$proxy_port" ]] && [[ $tries -lt 30 ]]; do
