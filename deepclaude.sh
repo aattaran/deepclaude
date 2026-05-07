@@ -92,6 +92,8 @@ set_model_env() {
     # (auto / bypassPermissions) treats the session as a Claude session.
     # The local proxy translates these names back to backend-specific names
     # on the wire via MODEL_REMAP in proxy/model-proxy.js.
+    # IMPORTANT: these names must remain keys in every MODEL_REMAP backend
+    # block, otherwise unmapped requests will 404 against the backend.
     export ANTHROPIC_DEFAULT_OPUS_MODEL="claude-opus-4-7"
     export ANTHROPIC_DEFAULT_SONNET_MODEL="claude-sonnet-4-6"
     export ANTHROPIC_DEFAULT_HAIKU_MODEL="claude-haiku-4-5-20251001"

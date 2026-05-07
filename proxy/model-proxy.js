@@ -331,6 +331,8 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                             console.log(`[MODEL-PROXY] #${reqId} model remap: ${parsed.model} → ${mapped}`);
                             parsed.model = mapped;
                             body = Buffer.from(JSON.stringify(parsed));
+                        } else {
+                            console.warn(`[MODEL-PROXY] #${reqId} WARN: no remap for "${parsed.model}" in mode "${state.mode}" — forwarding as-is`);
                         }
                     } catch { /* not JSON or parse error, pass through */ }
                 }
