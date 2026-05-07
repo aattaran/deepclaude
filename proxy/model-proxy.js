@@ -6,6 +6,7 @@ import { Transform } from 'stream';
 const ANTHROPIC_FALLBACK = 'https://api.anthropic.com';
 const MODEL_PATHS = ['/v1/messages'];
 const REQUEST_TIMEOUT_MS = 5 * 60 * 1000; // 5 min per request
+const IMAGE_FALLBACK_ENABLED = (process.env.DEEPCLAUDE_IMAGE_FALLBACK || 'anthropic') !== 'off';
 
 const MODEL_REMAP = {
     deepseek: {
@@ -25,11 +26,16 @@ const MODEL_REMAP = {
 };
 
 const PRICING_PER_M = {
-    deepseek:   { input: 0.44,  output: 0.87 },
-    openrouter: { input: 0.44,  output: 0.87 },
-    fireworks:  { input: 1.74,  output: 3.48 },
-    anthropic:  { input: 3.00,  output: 15.00 },
-    _single:    { input: 0.44,  output: 0.87 },
+    deepseek:      { input: 0.44,  output: 0.87 },
+    openrouter:    { input: 0.44,  output: 0.87 },
+    fireworks:     { input: 1.74,  output: 3.48 },
+    anthropic:     { input: 3.00,  output: 15.00 },
+    // Image-rerouted turns: Max OAuth consumes subscription quota, not
+    // per-token billing, so cost is 0. anthropic_equivalent (computed
+    // from PRICING_PER_M.anthropic in getCostSummary) still reflects
+    // what per-token Anthropic would have charged — feeding savings.
+    anthropic_max: { input: 0,     output: 0 },
+    _single:       { input: 0.44,  output: 0.87 },
 };
 
 /**
@@ -302,24 +308,29 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
             clientReq.on('data', c => chunks.push(c));
             clientReq.on('end', () => {
                 let body = Buffer.concat(chunks);
+                const isMessagesPath = MODEL_PATHS.includes(urlPath);
 
-                const imageFallbackEnabled = (process.env.DEEPCLAUDE_IMAGE_FALLBACK || 'anthropic') !== 'off';
-                let forceAnthropicForImage = false;
-                if (imageFallbackEnabled && state.mode !== 'anthropic' && MODEL_PATHS.includes(urlPath)) {
-                    try {
-                        const parsed = JSON.parse(body);
-                        if (containsImageBlock(parsed.messages)) {
-                            forceAnthropicForImage = true;
-                        }
-                    } catch {}
+                // Parse /v1/messages bodies once; downstream mutations all
+                // operate on this object and we re-stringify a single time
+                // below. `parsed` stays null for non-messages paths or
+                // non-JSON bodies, in which case `body` is forwarded verbatim.
+                let parsed = null;
+                if (isMessagesPath) {
+                    try { parsed = JSON.parse(body); } catch {}
                 }
 
+                const forceAnthropicForImage = (
+                    IMAGE_FALLBACK_ENABLED &&
+                    state.mode !== 'anthropic' &&
+                    parsed != null &&
+                    containsImageBlock(parsed.messages)
+                );
+
                 const isAnthropicMode = state.mode === 'anthropic' || forceAnthropicForImage;
-                const isModelCall = !isAnthropicMode && MODEL_PATHS.includes(urlPath);
+                const isModelCall = !isAnthropicMode && isMessagesPath;
+                const trackUsage = isModelCall || forceAnthropicForImage;
                 const dest = isModelCall ? state.target : new URL(ANTHROPIC_FALLBACK);
-                // Image turns are tracked under "anthropic" so cost/savings reflect
-                // where the request actually went.
-                const effectiveMode = forceAnthropicForImage ? 'anthropic' : state.mode;
+                const effectiveMode = forceAnthropicForImage ? 'anthropic_max' : state.mode;
 
                 // Build upstream path. target.pathname may overlap with
                 // clientReq.url (e.g. OpenRouter /api/v1 + /v1/messages).
@@ -336,7 +347,7 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                     fullPath = clientReq.url;
                 }
 
-                if (isModelCall || forceAnthropicForImage) {
+                if (trackUsage) {
                     const tag = forceAnthropicForImage ? ' [image→anthropic]' : '';
                     console.log(`[MODEL-PROXY] #${reqId} → ${dest.hostname}${fullPath}${tag}`);
                 }
@@ -360,57 +371,45 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                 }
                 // For forceAnthropicForImage we leave the client's auth headers
                 // intact so Claude Code's OAuth bearer (Max) flows through to
-                // api.anthropic.com unchanged.
+                // api.anthropic.com unchanged. Assumes Claude Code is auth'd
+                // via OAuth; if the client uses x-api-key only, the rerouted
+                // request will hit Anthropic without a valid credential and 401.
 
-                // When auto-routing to Anthropic for vision, drop the request
-                // `thinking` field and `context_management`. The
-                // `clear_thinking_*` strategies require thinking to be enabled,
-                // and Anthropic 400s on the mismatch.
-                if (forceAnthropicForImage) {
-                    try {
-                        const parsed = JSON.parse(body);
+                // Body mutations on the parsed object, in order:
+                //   - Image-reroute: drop `thinking` and `context_management`
+                //     (clear_thinking_* requires thinking enabled; Anthropic
+                //     400s on the mismatch).
+                //   - Model call: remap Anthropic model names to the
+                //     backend-specific name.
+                //   - Thinking-block strip:
+                //       Anthropic + (prior non-Anthropic session OR
+                //       image-routed) → strip ALL (foreign backends emit
+                //       signed-but-invalid blocks).
+                //       Anthropic + pure Anthropic session → strip unsigned.
+                //       Non-Anthropic model call → strip ALL (backends reject
+                //       blocks they didn't generate).
+                if (parsed) {
+                    if (forceAnthropicForImage) {
                         delete parsed.thinking;
                         delete parsed.context_management;
-                        body = Buffer.from(JSON.stringify(parsed));
-                    } catch {}
-                }
-
-                // Remap Anthropic model names to backend-specific names
-                if (isModelCall && MODEL_REMAP[state.mode]) {
-                    try {
-                        const parsed = JSON.parse(body);
+                    }
+                    if (isModelCall && MODEL_REMAP[state.mode]) {
                         const mapped = MODEL_REMAP[state.mode][parsed.model];
                         if (mapped) {
                             console.log(`[MODEL-PROXY] #${reqId} model remap: ${parsed.model} → ${mapped}`);
                             parsed.model = mapped;
-                            body = Buffer.from(JSON.stringify(parsed));
                         }
-                    } catch { /* not JSON or parse error, pass through */ }
-                }
-
-                // Strip thinking blocks before forwarding.
-                // Non-Anthropic: strip ALL blocks — backends reject thinking blocks
-                // they didn't generate, even unsigned ones.
-                // Anthropic after a non-Anthropic session OR image-routed: also strip
-                // ALL, because foreign backends generate signed-but-invalid thinking
-                // blocks that stripUnsignedThinkingBlocks would pass through.
-                if (isAnthropicMode && MODEL_PATHS.includes(urlPath)) {
-                    try {
-                        const parsed = JSON.parse(body);
+                    }
+                    if (isAnthropicMode) {
                         if (state.hadNonAnthropicSession || forceAnthropicForImage) {
                             stripAllThinkingBlocks(parsed);
                         } else {
                             stripUnsignedThinkingBlocks(parsed);
                         }
-                        body = Buffer.from(JSON.stringify(parsed));
-                    } catch { /* pass through */ }
-                }
-                if (isModelCall) {
-                    try {
-                        const parsed = JSON.parse(body);
+                    } else if (isModelCall) {
                         stripAllThinkingBlocks(parsed);
-                        body = Buffer.from(JSON.stringify(parsed));
-                    } catch { /* pass through */ }
+                    }
+                    body = Buffer.from(JSON.stringify(parsed));
                 }
 
                 const opts = {
@@ -422,7 +421,6 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                     timeout: REQUEST_TIMEOUT_MS,
                 };
 
-                const trackUsage = isModelCall || forceAnthropicForImage;
                 const proxyReq = httpsRequest(opts, (proxyRes) => {
                     if (trackUsage) {
                         const ttfb = Date.now() - t0;
