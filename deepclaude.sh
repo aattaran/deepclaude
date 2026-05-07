@@ -25,6 +25,7 @@ BACKEND="${CHEAPCLAUDE_DEFAULT_BACKEND:-ds}"
 ACTION="launch"
 SWITCH_BACKEND=""
 PROXY_PID=""
+AUTO_MODE=0
 
 # --- Parse args ---
 while [[ $# -gt 0 ]]; do
@@ -32,6 +33,7 @@ while [[ $# -gt 0 ]]; do
         --backend|-b) BACKEND="$2"; shift 2 ;;
         --switch|-s)  ACTION="switch"; SWITCH_BACKEND="$2"; shift 2 ;;
         --remote|-r)  ACTION="remote"; shift ;;
+        --auto)       AUTO_MODE=1; shift ;;
         --status)     ACTION="status"; shift ;;
         --cost)       ACTION="cost"; shift ;;
         --benchmark)  ACTION="benchmark"; shift ;;
@@ -88,16 +90,25 @@ resolve_backend() {
 }
 
 set_model_env() {
-    # Use canonical Claude model names so Claude Code's permission gate
-    # (auto / bypassPermissions) treats the session as a Claude session.
-    # The local proxy translates these names back to backend-specific names
-    # on the wire via MODEL_REMAP in proxy/model-proxy.js.
-    # IMPORTANT: these names must remain keys in every MODEL_REMAP backend
-    # block, otherwise unmapped requests will 404 against the backend.
-    export ANTHROPIC_DEFAULT_OPUS_MODEL="claude-opus-4-7"
-    export ANTHROPIC_DEFAULT_SONNET_MODEL="claude-sonnet-4-6"
-    export ANTHROPIC_DEFAULT_HAIKU_MODEL="claude-haiku-4-5-20251001"
-    export CLAUDE_CODE_SUBAGENT_MODEL="claude-haiku-4-5-20251001"
+    if [[ "$AUTO_MODE" == "1" ]]; then
+        # Canonical Claude model names so Claude Code's permission gate
+        # (auto / bypassPermissions) treats the session as a Claude session.
+        # The local proxy translates these names back to backend-specific
+        # names on the wire via MODEL_REMAP in proxy/model-proxy.js.
+        # IMPORTANT: these names must remain keys in every MODEL_REMAP
+        # backend block, otherwise unmapped requests will 404.
+        export ANTHROPIC_DEFAULT_OPUS_MODEL="claude-opus-4-7"
+        export ANTHROPIC_DEFAULT_SONNET_MODEL="claude-sonnet-4-6"
+        export ANTHROPIC_DEFAULT_HAIKU_MODEL="claude-haiku-4-5-20251001"
+        export CLAUDE_CODE_SUBAGENT_MODEL="claude-haiku-4-5-20251001"
+    else
+        # Backend names visible in the TUI; auto/bypassPermissions disabled
+        # because Claude Code's gate only unlocks for claude-* model names.
+        export ANTHROPIC_DEFAULT_OPUS_MODEL="$RESOLVED_OPUS"
+        export ANTHROPIC_DEFAULT_SONNET_MODEL="$RESOLVED_SONNET"
+        export ANTHROPIC_DEFAULT_HAIKU_MODEL="$RESOLVED_HAIKU"
+        export CLAUDE_CODE_SUBAGENT_MODEL="$RESOLVED_SUBAGENT"
+    fi
     export CLAUDE_CODE_EFFORT_LEVEL="max"
 }
 
@@ -219,6 +230,8 @@ show_help() {
     echo "Options:"
     echo "  -b, --backend <ds|or|fw|anthropic>  Backend (default: ds)"
     echo "  -r, --remote                        Remote control mode (browser URL)"
+    echo "  --auto                               Unlock auto/bypassPermissions modes"
+    echo "                                       (TUI shows claude-* names instead of backend names)"
     echo "  --status                             Show keys and backends"
     echo "  --cost                               Pricing comparison"
     echo "  --benchmark                          Latency test"
@@ -276,6 +289,17 @@ run_benchmark() {
     echo ""
 }
 
+print_auto_mode_tip() {
+    if [[ "$AUTO_MODE" == "1" ]]; then
+        echo "  Auto mode: ON (TUI will show 'claude-opus-4-7'; shift+tab cycles modes)"
+    else
+        local backend_long
+        backend_long=$(backend_long_name "$BACKEND") || backend_long="$BACKEND"
+        echo "  Auto mode: OFF (running $backend_long; TUI will show '$RESOLVED_OPUS')"
+        echo "  Tip: pass --auto to enable auto mode — TUI will show 'claude-opus-4-7' instead"
+    fi
+}
+
 # Run claude and surface the tail of $PROXY_LOG if it exits abnormally.
 # Skips signal-induced exits (>=128, e.g. 130 SIGINT, 143 SIGTERM) so
 # Ctrl+C doesn't dump a noisy log on intentional quit.
@@ -312,6 +336,7 @@ launch_claude() {
     echo "  Launching Claude Code via $BACKEND..."
     echo "  Proxy on :$PROXY_PORT -> $RESOLVED_URL"
     echo "  Model: $RESOLVED_OPUS (main) + $RESOLVED_HAIKU (subagents)"
+    print_auto_mode_tip
     echo ""
 
     # Route through local proxy so the model name remap fires and Claude Code
@@ -343,6 +368,7 @@ launch_remote() {
 
     echo "  Proxy on :$PROXY_PORT -> $RESOLVED_URL"
     echo "  Launching remote control via $BACKEND..."
+    print_auto_mode_tip
     echo ""
 
     export ANTHROPIC_BASE_URL="http://127.0.0.1:$PROXY_PORT"
