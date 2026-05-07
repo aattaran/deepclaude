@@ -25,17 +25,9 @@ const MODEL_REMAP = {
     },
 };
 
-// Reverse of MODEL_REMAP: backend-specific name → canonical claude-* name.
-// Used on image-fallback to translate the backend name Claude Code sent
-// (e.g. `deepseek-v4-pro`) back to a Claude name Anthropic recognizes
-// before the request leaves the proxy. The inbound response carries the
-// Claude name back; we translate it again so Claude Code sees the
-// backend name end-to-end and never knows about the swap.
-//
-// Many-to-one collisions (e.g. claude-opus-4-6 and claude-opus-4-7 both
-// map to deepseek-v4-pro) collapse to "last-write-wins" — which means
-// the most recent claude-* name in the table is what Anthropic gets
-// for that backend slot. That's the right default.
+// Many-to-one collisions in MODEL_REMAP collapse last-write-wins — so
+// `deepseek-v4-pro` reverses to `claude-opus-4-7` (the most recent key),
+// not `claude-opus-4-6`. That's the right default.
 const REVERSE_MODEL_REMAP = {};
 for (const [backend, table] of Object.entries(MODEL_REMAP)) {
     REVERSE_MODEL_REMAP[backend] = {};
@@ -49,10 +41,7 @@ const PRICING_PER_M = {
     openrouter:    { input: 0.44,  output: 0.87 },
     fireworks:     { input: 1.74,  output: 3.48 },
     anthropic:     { input: 3.00,  output: 15.00 },
-    // Image-rerouted turns: Max OAuth consumes subscription quota, not
-    // per-token billing, so cost is 0. anthropic_equivalent (computed
-    // from PRICING_PER_M.anthropic in getCostSummary) still reflects
-    // what per-token Anthropic would have charged — feeding savings.
+    // Max OAuth burns subscription quota, not per-token cost.
     anthropic_max: { input: 0,     output: 0 },
     _single:       { input: 0.44,  output: 0.87 },
 };
@@ -74,8 +63,6 @@ class UsageNormalizer extends Transform {
         this._onUsage = onUsage;
         this._inputTokens = 0;
         this._outputTokens = 0;
-        // { from: 'claude-opus-4-7', to: 'deepseek-v4-pro' } — applied to
-        // message.model in message_start events. Null = no rewrite.
         this._modelRewrite = modelRewrite || null;
     }
 
@@ -330,20 +317,15 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
             const reqId = ++reqCount;
             const t0 = Date.now();
 
-            // Routing is deferred to the end-of-body handler so we can
-            // inspect the request body for image content blocks and flip a
-            // single request from a non-Anthropic backend to api.anthropic.com.
-            // Disable with DEEPCLAUDE_IMAGE_FALLBACK=off.
+            // Routing is deferred to the end-of-body handler so the body
+            // can be inspected for image content blocks before the
+            // dest/headers are decided.
             const chunks = [];
             clientReq.on('data', c => chunks.push(c));
             clientReq.on('end', () => {
                 let body = Buffer.concat(chunks);
                 const isMessagesPath = MODEL_PATHS.includes(urlPath);
 
-                // Single body parse. Downstream mutations all operate on
-                // `parsed` and we re-stringify once at the end. `parsed`
-                // stays null for non-messages paths or non-JSON bodies, in
-                // which case `body` is forwarded verbatim.
                 let parsed = null;
                 if (isMessagesPath) {
                     try { parsed = JSON.parse(body); } catch {}
@@ -360,17 +342,10 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                 const isModelCall = !isAnthropicMode && isMessagesPath;
                 const trackUsage = isModelCall || forceAnthropicForImage;
                 const dest = isModelCall ? state.target : new URL(ANTHROPIC_FALLBACK);
-                // Image-rerouted turns get their own bucket: cost=0 (Max is
-                // subscription quota, not per-token) so total_cost stays
-                // truthful, while anthropic_equivalent still reflects what
-                // per-token Anthropic would have charged — feeding savings.
                 const effectiveMode = forceAnthropicForImage ? 'anthropic_max' : state.mode;
 
-                // For image-reroute, capture the backend model name so we
-                // can swap it to the canonical claude-* name on outbound
-                // (Anthropic doesn't recognize backend names like
-                // `deepseek-v4-pro`) and restore the backend name on the
-                // inbound response — Claude Code never sees the swap.
+                // Two-sided swap: outbound to Anthropic, reversed on the
+                // response so Claude Code never sees a non-backend name.
                 let imageRewrite = null;
                 if (forceAnthropicForImage && parsed?.model) {
                     const canonical = REVERSE_MODEL_REMAP[state.mode]?.[parsed.model];
@@ -419,25 +394,13 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                         headers['x-api-key'] = state.apiKey;
                     }
                 }
-                // For forceAnthropicForImage we leave the client's auth
-                // headers intact — whatever Claude Code is carrying (OAuth
-                // bearer from `claude login`, an explicit
-                // ANTHROPIC_AUTH_TOKEN, etc.) is what Anthropic sees.
+                // forceAnthropicForImage path leaves the client auth header
+                // intact — whatever Claude Code is carrying authenticates
+                // at Anthropic.
 
-                // Body mutations on the parsed object, in order:
-                //   - Image-reroute: drop `thinking` and `context_management`
-                //     (clear_thinking_* requires thinking enabled; Anthropic
-                //     400s on the mismatch). Swap model → canonical claude-*.
-                //   - Model call: remap Anthropic model names to the
-                //     backend-specific name.
-                //   - Thinking-block strip:
-                //       Anthropic + (prior non-Anthropic session OR
-                //       image-routed) → strip ALL (foreign backends emit
-                //       signed-but-invalid blocks).
-                //       Anthropic + pure Anthropic session → strip unsigned.
-                //       Non-Anthropic model call → strip ALL (backends reject
-                //       blocks they didn't generate).
                 if (parsed) {
+                    // clear_thinking_* requires thinking enabled; Anthropic
+                    // 400s on the mismatch.
                     if (forceAnthropicForImage) {
                         delete parsed.thinking;
                         delete parsed.context_management;
@@ -454,6 +417,10 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                         }
                     }
 
+                    // Foreign backends emit signed-but-invalid thinking
+                    // blocks; strip ALL when crossing into or out of one.
+                    // Pure Anthropic sessions strip only unsigned, preserving
+                    // valid signed blocks for continuity.
                     if (isAnthropicMode) {
                         if (state.hadNonAnthropicSession || forceAnthropicForImage) {
                             stripAllThinkingBlocks(parsed);
@@ -486,10 +453,9 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                     const isSSE = ct.includes('text/event-stream');
 
                     if (trackUsage && isSSE) {
-                        // Strip content-encoding from forwarded headers — proxy
-                        // mutates the body via UsageNormalizer (toString on
-                        // bytes), so any upstream gzip bytes would arrive at
-                        // the client with the gzip header but non-gzip payload.
+                        // Mirror of the accept-encoding strip on the request
+                        // side — the response body is being mutated, so the
+                        // forwarded headers must not advertise gzip.
                         const { 'content-encoding': _ce1, ...sseHeaders } = proxyRes.headers;
                         clientRes.writeHead(proxyRes.statusCode, sseHeaders);
                         const modelRewrite = imageRewrite
@@ -512,9 +478,6 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                             try {
                                 const j = JSON.parse(fixed);
                                 if (j.usage) recordUsage(effectiveMode, j.usage.input_tokens, j.usage.output_tokens);
-                                // Image-reroute: swap response.model back from
-                                // canonical claude-* to the backend name
-                                // Claude Code originally sent.
                                 if (imageRewrite && j.model === imageRewrite.canonical) {
                                     j.model = imageRewrite.backend;
                                     fixed = Buffer.from(JSON.stringify(j));

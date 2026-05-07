@@ -105,11 +105,9 @@ backend_long_name() {
     esac
 }
 
-# Starts proxy/start-proxy.js in the background and waits for it to bind a
-# port. Sets PROXY_PID, PROXY_PORT, PROXY_LOG as script globals so the EXIT
-# trap (cleanup_proxy) can see the pid. Must be called WITHOUT command
-# substitution — $(start_proxy) would run in a subshell and the globals
-# would never reach the parent.
+# Sets PROXY_PID, PROXY_PORT, PROXY_LOG as script globals so the EXIT trap
+# can clean up the node child. Must be called WITHOUT command substitution
+# — $(start_proxy) runs in a subshell and globals never reach the parent.
 # Requires: RESOLVED_URL, RESOLVED_KEY, BACKEND already set.
 start_proxy() {
     local backend_long
@@ -274,9 +272,6 @@ launch_claude() {
     resolve_backend
 
     echo "  Starting model proxy for $BACKEND..."
-    # Call directly (not via $()): start_proxy sets PROXY_PID/PROXY_PORT/PROXY_LOG
-    # as script globals. A subshell would lose them and the EXIT trap would
-    # leak the node child.
     start_proxy
     echo "  Proxy log: $PROXY_LOG"
 
@@ -285,17 +280,13 @@ launch_claude() {
     echo "  Model: $RESOLVED_OPUS (main) + $RESOLVED_HAIKU (subagents)"
     echo ""
 
-    # Route through the local proxy. The proxy holds the backend API key
-    # privately (passed via argv to start-proxy.js) and substitutes it for
-    # outbound requests to the backend. We deliberately leave Claude Code's
-    # own auth state alone — whatever it had (OAuth bearer from `claude
-    # login`, an existing ANTHROPIC_AUTH_TOKEN, etc.) flows through and is
-    # used only on the image-fallback path where the proxy reroutes to
-    # api.anthropic.com.
     export ANTHROPIC_BASE_URL="http://127.0.0.1:$PROXY_PORT"
     set_model_env
+    # Deliberately do not unset ANTHROPIC_AUTH_TOKEN — whatever Claude Code
+    # is carrying is what authenticates at Anthropic on the image-reroute
+    # path; the proxy injects backend auth for non-image turns separately.
 
-    # Don't `exec` — we want the EXIT trap to clean up the proxy.
+    # Don't `exec` — the EXIT trap needs to fire to stop the proxy.
     claude "$@"
 }
 
