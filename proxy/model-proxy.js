@@ -349,6 +349,13 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                     try {
                         const parsed = JSON.parse(body);
                         stripAllThinkingBlocks(parsed);
+                        // Top-level thinking/context_management have to go too.
+                        // DeepSeek 400s with "content[].thinking in the thinking
+                        // mode must be passed back" when the body advertises
+                        // thinking but messages don't carry the blocks (which
+                        // we just stripped, since foreign blocks are invalid).
+                        delete parsed.thinking;
+                        delete parsed.context_management;
                         body = Buffer.from(JSON.stringify(parsed));
                     } catch { /* pass through */ }
                 }
