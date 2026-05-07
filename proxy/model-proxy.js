@@ -322,7 +322,7 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                 const forceAnthropicForImage = (
                     IMAGE_FALLBACK_ENABLED &&
                     state.mode !== 'anthropic' &&
-                    parsed != null &&
+                    parsed &&
                     containsImageBlock(parsed.messages)
                 );
 
@@ -375,24 +375,14 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                 // via OAuth; if the client uses x-api-key only, the rerouted
                 // request will hit Anthropic without a valid credential and 401.
 
-                // Body mutations on the parsed object, in order:
-                //   - Image-reroute: drop `thinking` and `context_management`
-                //     (clear_thinking_* requires thinking enabled; Anthropic
-                //     400s on the mismatch).
-                //   - Model call: remap Anthropic model names to the
-                //     backend-specific name.
-                //   - Thinking-block strip:
-                //       Anthropic + (prior non-Anthropic session OR
-                //       image-routed) → strip ALL (foreign backends emit
-                //       signed-but-invalid blocks).
-                //       Anthropic + pure Anthropic session → strip unsigned.
-                //       Non-Anthropic model call → strip ALL (backends reject
-                //       blocks they didn't generate).
                 if (parsed) {
+                    // Anthropic 400s on `clear_thinking_*` strategies without
+                    // thinking enabled, so drop both fields on image-reroute.
                     if (forceAnthropicForImage) {
                         delete parsed.thinking;
                         delete parsed.context_management;
                     }
+
                     if (isModelCall && MODEL_REMAP[state.mode]) {
                         const mapped = MODEL_REMAP[state.mode][parsed.model];
                         if (mapped) {
@@ -400,6 +390,11 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                             parsed.model = mapped;
                         }
                     }
+
+                    // Foreign backends emit signed-but-invalid thinking blocks
+                    // that Anthropic rejects, so strip ALL when crossing into
+                    // or out of one. Pure Anthropic sessions strip only
+                    // unsigned blocks (preserves valid signed ones).
                     if (isAnthropicMode) {
                         if (state.hadNonAnthropicSession || forceAnthropicForImage) {
                             stripAllThinkingBlocks(parsed);
@@ -409,6 +404,7 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                     } else if (isModelCall) {
                         stripAllThinkingBlocks(parsed);
                     }
+
                     body = Buffer.from(JSON.stringify(parsed));
                 }
 
