@@ -22,6 +22,13 @@ const MODEL_REMAP = {
         'claude-sonnet-4-5-20250929': 'deepseek/deepseek-v4-flash',
         'claude-haiku-4-5-20251001':  'deepseek/deepseek-v4-flash',
     },
+    fireworks: {
+        'claude-opus-4-6':    'accounts/fireworks/models/deepseek-v4-pro',
+        'claude-opus-4-7':    'accounts/fireworks/models/deepseek-v4-pro',
+        'claude-sonnet-4-6':  'accounts/fireworks/models/deepseek-v4-flash',
+        'claude-sonnet-4-5-20250929': 'accounts/fireworks/models/deepseek-v4-flash',
+        'claude-haiku-4-5-20251001':  'accounts/fireworks/models/deepseek-v4-flash',
+    },
 };
 
 const PRICING_PER_M = {
@@ -324,6 +331,11 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                             console.log(`[MODEL-PROXY] #${reqId} model remap: ${parsed.model} → ${mapped}`);
                             parsed.model = mapped;
                             body = Buffer.from(JSON.stringify(parsed));
+                        } else if (parsed.model?.startsWith('claude-')) {
+                            // Caught a claude-* name with no entry — usually
+                            // means MODEL_REMAP fell behind an Anthropic model
+                            // bump. Log so the gap is visible.
+                            console.warn(`[MODEL-PROXY] #${reqId} WARN: no MODEL_REMAP[${state.mode}] entry for ${parsed.model}; forwarding as-is`);
                         }
                     } catch { /* not JSON or parse error, pass through */ }
                 }

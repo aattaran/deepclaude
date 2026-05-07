@@ -4,7 +4,17 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Resolve SCRIPT_DIR through any symlink chain (e.g. /usr/local/bin/deepclaude
+# -> /path/to/repo/deepclaude.sh) so $SCRIPT_DIR/proxy/... works regardless of
+# how the script was invoked.
+_source="${BASH_SOURCE[0]}"
+while [ -L "$_source" ]; do
+    _dir="$(cd "$(dirname "$_source")" && pwd)"
+    _source="$(readlink "$_source")"
+    [[ "$_source" != /* ]] && _source="$_dir/$_source"
+done
+SCRIPT_DIR="$(cd "$(dirname "$_source")" && pwd)"
+unset _source _dir
 
 # --- Config ---
 DEEPSEEK_URL="https://api.deepseek.com/anthropic"
@@ -15,6 +25,7 @@ BACKEND="${CHEAPCLAUDE_DEFAULT_BACKEND:-ds}"
 ACTION="launch"
 SWITCH_BACKEND=""
 PROXY_PID=""
+AUTO_MODE=0
 
 # --- Parse args ---
 while [[ $# -gt 0 ]]; do
@@ -22,6 +33,7 @@ while [[ $# -gt 0 ]]; do
         --backend|-b) BACKEND="$2"; shift 2 ;;
         --switch|-s)  ACTION="switch"; SWITCH_BACKEND="$2"; shift 2 ;;
         --remote|-r)  ACTION="remote"; shift ;;
+        --auto)       AUTO_MODE=1; shift ;;
         --status)     ACTION="status"; shift ;;
         --cost)       ACTION="cost"; shift ;;
         --benchmark)  ACTION="benchmark"; shift ;;
@@ -78,11 +90,77 @@ resolve_backend() {
 }
 
 set_model_env() {
-    export ANTHROPIC_DEFAULT_OPUS_MODEL="$RESOLVED_OPUS"
-    export ANTHROPIC_DEFAULT_SONNET_MODEL="$RESOLVED_SONNET"
-    export ANTHROPIC_DEFAULT_HAIKU_MODEL="$RESOLVED_HAIKU"
-    export CLAUDE_CODE_SUBAGENT_MODEL="$RESOLVED_SUBAGENT"
+    if [[ "$AUTO_MODE" == "1" ]]; then
+        # Claude Code's auto / bypassPermissions modes are gated on the env
+        # var being a `claude-*` name; the proxy translates back to the
+        # backend name on the wire via MODEL_REMAP. The TUI welcome chip
+        # will display the canonical name — that's the explicit tradeoff
+        # surfaced by print_auto_mode_tip at launch.
+        export ANTHROPIC_DEFAULT_OPUS_MODEL="claude-opus-4-7"
+        export ANTHROPIC_DEFAULT_SONNET_MODEL="claude-sonnet-4-6"
+        export ANTHROPIC_DEFAULT_HAIKU_MODEL="claude-haiku-4-5-20251001"
+        export CLAUDE_CODE_SUBAGENT_MODEL="claude-haiku-4-5-20251001"
+    else
+        export ANTHROPIC_DEFAULT_OPUS_MODEL="$RESOLVED_OPUS"
+        export ANTHROPIC_DEFAULT_SONNET_MODEL="$RESOLVED_SONNET"
+        export ANTHROPIC_DEFAULT_HAIKU_MODEL="$RESOLVED_HAIKU"
+        export CLAUDE_CODE_SUBAGENT_MODEL="$RESOLVED_SUBAGENT"
+    fi
     export CLAUDE_CODE_EFFORT_LEVEL="max"
+}
+
+backend_long_name() {
+    case "$1" in
+        ds|deepseek)   echo "deepseek" ;;
+        or|openrouter) echo "openrouter" ;;
+        fw|fireworks)  echo "fireworks" ;;
+        anthropic)     echo "anthropic" ;;
+        *) echo "ERROR: Unknown backend '$1'. Use: ds, or, fw, anthropic" >&2; return 1 ;;
+    esac
+}
+
+# Sets PROXY_PID, PROXY_PORT, PROXY_LOG as script globals so the EXIT trap
+# can clean up the node child. Must be called WITHOUT command substitution
+# — $(start_proxy) runs in a subshell and globals never reach the parent.
+# Requires: RESOLVED_URL, RESOLVED_KEY, BACKEND already set.
+start_proxy() {
+    local backend_long
+    backend_long=$(backend_long_name "$BACKEND") || exit 1
+
+    PROXY_LOG="${PROXY_LOG:-/tmp/deepclaude-proxy.$$.log}"
+    : > "$PROXY_LOG"
+    node "$SCRIPT_DIR/proxy/start-proxy.js" "$RESOLVED_URL" "$RESOLVED_KEY" "$backend_long" >> "$PROXY_LOG" 2>&1 &
+    PROXY_PID=$!
+
+    # The proxy emits a banner line, then a bare-numeric port line on a
+    # successful bind. Match the bare integer to skip the banner; do not
+    # introduce other numeric-only stdout in proxy startup.
+    local proxy_port=""
+    local tries=0
+    while [[ -z "$proxy_port" ]] && [[ $tries -lt 30 ]]; do
+        if kill -0 "$PROXY_PID" 2>/dev/null; then
+            # `|| true`: with `set -o pipefail`, grep no-match (exit 1)
+            # would otherwise exit the script; we expect zero matches on
+            # early iterations before the proxy has emitted its port.
+            proxy_port=$(grep -E '^[0-9]+$' "$PROXY_LOG" 2>/dev/null | head -1 || true)
+        else
+            echo "ERROR: Proxy process died during startup" >&2
+            echo "  Log: $PROXY_LOG" >&2
+            tail -20 "$PROXY_LOG" >&2 2>/dev/null
+            exit 1
+        fi
+        [[ -z "$proxy_port" ]] && sleep 0.2
+        tries=$((tries + 1))
+    done
+
+    if [[ -z "$proxy_port" ]]; then
+        echo "ERROR: Proxy failed to report a port within 6s" >&2
+        echo "  Log: $PROXY_LOG" >&2
+        tail -20 "$PROXY_LOG" >&2 2>/dev/null
+        exit 1
+    fi
+
+    PROXY_PORT="$proxy_port"
 }
 
 show_status() {
@@ -138,6 +216,8 @@ show_help() {
     echo "Options:"
     echo "  -b, --backend <ds|or|fw|anthropic>  Backend (default: ds)"
     echo "  -r, --remote                        Remote control mode (browser URL)"
+    echo "  --auto                               Unlock auto/bypassPermissions modes"
+    echo "                                       (TUI shows claude-* names; wire still routes to backend)"
     echo "  --status                             Show keys and backends"
     echo "  --cost                               Pricing comparison"
     echo "  --benchmark                          Latency test"
@@ -195,6 +275,18 @@ run_benchmark() {
     echo ""
 }
 
+print_auto_mode_tip() {
+    if [[ "$AUTO_MODE" == "1" ]]; then
+        echo "  Auto mode: ON"
+        echo "    TUI will display 'claude-opus-4-7' (auto/bypassPermissions unlocked)."
+        echo "    Actual routing: $RESOLVED_OPUS via $RESOLVED_URL."
+        echo "    Verify with: curl -s http://127.0.0.1:\$PROXY_PORT/_proxy/cost | jq"
+    else
+        echo "  Auto mode: OFF (TUI shows '$RESOLVED_OPUS')"
+        echo "    Pass --auto to unlock auto/bypassPermissions modes — TUI will then show 'claude-opus-4-7'."
+    fi
+}
+
 launch_claude() {
     if [[ "$BACKEND" == "anthropic" ]]; then
         echo "  Launching Claude Code (normal Anthropic backend)..."
@@ -207,17 +299,21 @@ launch_claude() {
 
     resolve_backend
 
+    echo "  Starting model proxy for $BACKEND..."
+    start_proxy
+    echo "  Proxy log: $PROXY_LOG"
+
     echo "  Launching Claude Code via $BACKEND..."
-    echo "  Endpoint: $RESOLVED_URL"
+    echo "  Proxy on :$PROXY_PORT -> $RESOLVED_URL"
     echo "  Model: $RESOLVED_OPUS (main) + $RESOLVED_HAIKU (subagents)"
+    print_auto_mode_tip
     echo ""
 
-    export ANTHROPIC_BASE_URL="$RESOLVED_URL"
-    export ANTHROPIC_AUTH_TOKEN="$RESOLVED_KEY"
+    export ANTHROPIC_BASE_URL="http://127.0.0.1:$PROXY_PORT"
     set_model_env
-    unset ANTHROPIC_API_KEY
 
-    exec claude "$@"
+    # Don't `exec` — the EXIT trap needs to fire to stop the proxy.
+    claude "$@"
 }
 
 launch_remote() {
@@ -257,6 +353,7 @@ launch_remote() {
 
     echo "  Proxy on :$proxy_port -> $RESOLVED_URL"
     echo "  Launching remote control via $BACKEND..."
+    print_auto_mode_tip
     echo ""
 
     export ANTHROPIC_BASE_URL="http://127.0.0.1:$proxy_port"
