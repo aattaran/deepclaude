@@ -368,6 +368,14 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                         console.log(`[MODEL-PROXY] #${reqId} TTFB ${ttfb}ms (status ${proxyRes.statusCode})`);
                     }
 
+                    // Backend can drop the connection mid-stream (own timeout,
+                    // restart, network glitch). Without this handler, Node's
+                    // EventEmitter throws 'Unhandled error' and crashes the proxy.
+                    proxyRes.on('error', (err) => {
+                        console.error(`[MODEL-PROXY] #${reqId} proxyRes error: ${err.message}`);
+                        if (!clientRes.destroyed) clientRes.destroy();
+                    });
+
                     const ct = proxyRes.headers['content-type'] || '';
                     const isSSE = ct.includes('text/event-stream');
 
@@ -414,9 +422,15 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                     const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
                     console.error(`[MODEL-PROXY] #${reqId} ERROR after ${elapsed}s: ${err.message}`);
                     if (!clientRes.headersSent) {
+                        // Headers not sent — safe to write a clean 502 JSON body.
                         clientRes.writeHead(502, { 'content-type': 'application/json' });
+                        clientRes.end(JSON.stringify({ error: { message: 'Upstream connection error' } }));
+                    } else if (!clientRes.destroyed) {
+                        // Headers already sent — likely SSE streaming. Appending
+                        // JSON would corrupt the stream and crash Claude Code's
+                        // SSE parser. Close the socket cleanly instead.
+                        clientRes.destroy();
                     }
-                    clientRes.end(JSON.stringify({ error: { message: 'Upstream connection error' } }));
                 });
 
                 proxyReq.end(body);
