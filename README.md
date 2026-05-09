@@ -73,14 +73,17 @@ Claude Code reads these environment variables to determine where to send API cal
 
 | Variable | What it does |
 |---|---|
-| `ANTHROPIC_BASE_URL` | API endpoint (default: api.anthropic.com) |
-| `ANTHROPIC_AUTH_TOKEN` | API key for the backend |
-| `ANTHROPIC_DEFAULT_OPUS_MODEL` | Model name for Opus-tier tasks |
-| `ANTHROPIC_DEFAULT_SONNET_MODEL` | Model name for Sonnet-tier tasks |
-| `ANTHROPIC_DEFAULT_HAIKU_MODEL` | Model name for Haiku-tier (subagents) |
+| `ANTHROPIC_BASE_URL` | API endpoint — deepclaude points this at the local proxy (`http://127.0.0.1:3200`) |
+| `ANTHROPIC_DEFAULT_OPUS_MODEL` | Canonical Claude model name (e.g. `claude-opus-4-7`) — proxy remaps per backend |
+| `ANTHROPIC_DEFAULT_SONNET_MODEL` | Same — proxy translates to `deepseek-v4-pro` etc. |
+| `ANTHROPIC_DEFAULT_HAIKU_MODEL` | Same — used for subagents |
 | `CLAUDE_CODE_SUBAGENT_MODEL` | Model for spawned subagents |
+| `DEEPSEEK_API_KEY` / `OPENROUTER_API_KEY` / `FIREWORKS_API_KEY` | Per-backend keys — proxy substitutes the right one per request |
+| `ANTHROPIC_API_KEY` | (Optional) Required only for mid-session `/anthropic` switching. Without it the proxy refuses anthropic mode and tells you to relaunch in `-b anthropic`. |
 
-**deepclaude** sets these per-session (not permanently), launches Claude Code, then restores your original settings on exit.
+**deepclaude** points Claude Code at the local proxy on `127.0.0.1:3200`. Your client auth (subscription OAuth or `ANTHROPIC_API_KEY`) flows through unchanged — the proxy strips it and substitutes the correct backend key per request, so you never have to set per-backend tokens for Claude Code itself.
+
+The proxy is launched per-session and shut down on exit. Logs go to `/tmp/proxy.log` (or `%TEMP%\deepclaude-proxy.log` on Windows) for diagnostics.
 
 ## Supported backends
 
@@ -110,6 +113,13 @@ export OPENROUTER_API_KEY="sk-or-..."    # macOS/Linux
 setx FIREWORKS_API_KEY "fw_..."          # Windows
 export FIREWORKS_API_KEY="fw_..."        # macOS/Linux
 ```
+
+**Anthropic** (optional, for mid-session `/anthropic` switching):
+```bash
+setx ANTHROPIC_API_KEY "sk-ant-api03-..."     # Windows
+export ANTHROPIC_API_KEY="sk-ant-api03-..."   # macOS/Linux
+```
+Required only if you want to flip into Anthropic mode mid-session via `/anthropic`. Without it, mid-session anthropic is unavailable but you can still run `deepclaude -b anthropic` for a pure-anthropic launch (uses your subscription).
 
 ## Cost comparison
 
@@ -147,7 +157,19 @@ DeepSeek's automatic context caching makes agent loops extremely cheap - after t
 
 ## Live switching (no restart)
 
-Switch between Anthropic and DeepSeek **mid-session** - from inside Claude Code itself. No restart, no terminal commands. Just type a slash command.
+Switch between Anthropic, DeepSeek, OpenRouter, and Fireworks **mid-session** — from inside Claude Code itself. No restart, no terminal commands. Just type a slash command.
+
+**Prerequisite for `/anthropic` mid-session switch:** set `ANTHROPIC_API_KEY` in your env BEFORE launching the wrapper. The proxy reads it at startup and substitutes it for `/anthropic` requests. Without it, the proxy refuses the switch with a clear error directing you to relaunch with `deepclaude -b anthropic`.
+
+```bash
+# enable full mid-session switching
+export ANTHROPIC_API_KEY=sk-ant-api03-...   # macOS/Linux
+$env:ANTHROPIC_API_KEY = "sk-ant-api03-..."  # Windows PowerShell
+
+deepclaude   # then /deepseek, /anthropic, /openrouter inside the TUI all work
+```
+
+**The hard architectural rule (finalized in this release):** every cross-mode switch is *path-isolated* — the proxy classifies thinking blocks by signature shape, strips foreign-signed blocks, and disables thinking-mode + clears `output_config` whenever any assistant turn in conversation history lacks a thinking block (DeepSeek's per-turn continuity rule). This eliminates the `content[].thinking ... must be passed back` 400-error class that previously fired on any `anthropic → deepseek` round-trip.
 
 **In Claude Code terminal:**
 

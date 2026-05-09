@@ -123,6 +123,41 @@ function stripUnsignedThinkingBlocks(body) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// SIGNATURE-SHAPE CLASSIFIERS (stateless heuristic).
+//
+// Anthropic thinking signatures are base64-encoded crypto signatures, typically
+// 80+ characters. DeepSeek thinking signatures observed in the wild are shorter
+// (hex-string or UUID-shape, well under 80 chars). The proxy uses these
+// heuristics to decide, per request, which thinking blocks to forward to which
+// destination — entirely from the request body, with no session state.
+// ─────────────────────────────────────────────────────────────────────────────
+function isLikelyAnthropicSignature(sig) {
+    return typeof sig === 'string' && sig.length >= 80;
+}
+function isLikelyDeepseekSignature(sig) {
+    return typeof sig === 'string' && sig.length > 0 && sig.length < 80;
+}
+
+/**
+ * Walk parsed.messages[] and filter thinking blocks by a per-block predicate.
+ * Returns { kept, stripped } counts. Mutates parsed in place.
+ */
+function filterThinkingBlocks(parsed, keepPredicate) {
+    let kept = 0, stripped = 0;
+    if (!parsed?.messages) return { kept, stripped };
+    for (const msg of parsed.messages) {
+        if (!Array.isArray(msg.content)) continue;
+        msg.content = msg.content.filter(block => {
+            if (block.type !== 'thinking') return true;
+            if (keepPredicate(block)) { kept++; return true; }
+            stripped++;
+            return false;
+        });
+    }
+    return { kept, stripped };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // PER-PATH REQUEST PROCESSORS
 //
 // Each function owns the full request-side transformation for its path. There
@@ -134,22 +169,60 @@ function stripUnsignedThinkingBlocks(body) {
 /**
  * PATH A — Anthropic (state.mode === 'anthropic')
  *
- * Forwarding to api.anthropic.com.
- *  • If the conversation history contains turns from a non-Anthropic backend
- *    (state.hadNonAnthropicSession), strip ALL thinking blocks. Foreign
- *    backends generate signed-but-invalid blocks that pass the unsigned
- *    filter and trip Anthropic 400s.
- *  • Otherwise, strip only UNSIGNED thinking blocks (Anthropic's normal
- *    requirement — its own signed blocks are valid and must be passed back).
+ * Forwarding to api.anthropic.com. Stateless: classifies thinking blocks by
+ * signature shape per request — no session flags consulted.
+ *  • Strip context-tier suffix ("claude-opus-4-7[1m]" → "claude-opus-4-7").
+ *  • CLEAN-BREAK on mixed-sig histories: Anthropic's API requires signed
+ *    thinking blocks to round-trip EXACTLY within a thinking-budget chain.
+ *    A partial strip (drop foreign, keep same-sig) leaves gaps in the kept
+ *    sequence — the surviving anthropic-sig blocks reference cryptographic
+ *    state that the API expects to be contiguous, and the missing turns
+ *    invalidate the chain. So if ANY foreign-sig block is detected, drop ALL
+ *    thinking blocks. Anthropic treats the resulting messages[] as a fresh
+ *    thinking conversation — no continuity assumed. Subsequent same-mode
+ *    turns recover thinking once new anthropic-sig blocks accumulate.
+ *  • If no foreign-sig blocks present (all anthropic-shaped or none), keep
+ *    them as-is — that's a legitimate same-backend continuation.
+ *  • parsed.thinking is left intact — Anthropic accepts thinking-mode without
+ *    prior thinking blocks on the first turn (or after a clean break).
  *  • No model remap.
  */
 function processAnthropicRequest(body, state, reqId) {
     try {
         const parsed = JSON.parse(body);
-        if (state.hadNonAnthropicSession) {
-            stripAllThinkingBlocks(parsed);
+        if (parsed.model && /\[\d+[mk]\]$/i.test(parsed.model)) {
+            const original = parsed.model;
+            parsed.model = parsed.model.replace(/\[\d+[mk]\]$/i, '');
+            console.log(`[MODEL-PROXY] #${reqId} stripped tier suffix: ${original} -> ${parsed.model}`);
+        }
+        // First pass: detect FOREIGN-SIG blocks (deepseek-shaped). Unsigned
+        // thinking is NOT a continuity-breaker for Anthropic — it's just a
+        // malformed block that gets stripped without affecting the chain.
+        // Only deepseek-shaped sigs in a kept anthropic-sig chain break it.
+        let foreignCount = 0;
+        if (parsed?.messages) {
+            for (const msg of parsed.messages) {
+                if (!Array.isArray(msg.content)) continue;
+                for (const block of msg.content) {
+                    if (block.type === 'thinking' && isLikelyDeepseekSignature(block.signature)) {
+                        foreignCount++;
+                    }
+                }
+            }
+        }
+        if (foreignCount > 0) {
+            // Clean break: strip ALL thinking blocks (anth-sig + foreign + unsigned)
+            const r = filterThinkingBlocks(parsed, () => false);
+            console.log(`[MODEL-PROXY] #${reqId} clean-break strip: removed all ${r.stripped} thinking blocks (${foreignCount} foreign-sig present) — Anthropic continuity unrecoverable`);
         } else {
-            stripUnsignedThinkingBlocks(parsed);
+            // No foreign-sig blocks; keep anthropic-sig, drop unsigned (Anthropic rejects unsigned).
+            const { kept, stripped } = filterThinkingBlocks(
+                parsed,
+                block => isLikelyAnthropicSignature(block.signature)
+            );
+            if (stripped > 0) {
+                console.log(`[MODEL-PROXY] #${reqId} stripped ${stripped} unsigned thinking blocks (kept ${kept} signed)`);
+            }
         }
         return Buffer.from(JSON.stringify(parsed));
     } catch {
@@ -161,27 +234,66 @@ function processAnthropicRequest(body, state, reqId) {
 /**
  * PATH B — DeepSeek (state.mode === 'deepseek')
  *
- * Forwarding to DeepSeek's Anthropic-compat endpoint.
+ * Forwarding to DeepSeek's Anthropic-compat endpoint. Stateless: classifies
+ * thinking blocks by signature shape per request — no session flags consulted.
  *  • Apply MODEL_REMAP['deepseek'] to the `model` field.
- *  • DO NOT strip thinking blocks. DeepSeek's endpoint REQUIRES prior
- *    thinking blocks to be passed back when the request includes
- *    thinking-mode parameters; absence returns 400 with
- *    "content[].thinking ... must be passed back".
- *  • The JSONL Claude Code persists will reflect real DeepSeek content
- *    (foreign-signed thinking, deepseek-v4-pro model name). That is by
- *    design — a DeepSeek session is a DeepSeek session.
+ *  • CLEAN-BREAK on mixed-sig histories: DeepSeek validates per-turn thinking
+ *    continuity. A partial strip (drop anth-sig, keep ds-sig) leaves gaps in
+ *    the kept ds-sig sequence — DeepSeek then rejects with 400 even when
+ *    parsed.thinking is removed, because the kept blocks reference state from
+ *    turns that no longer exist. So when ANY foreign-sig (anthropic-shaped)
+ *    block is detected, drop ALL thinking blocks AND drop parsed.thinking.
+ *    DeepSeek treats the resulting messages[] as a fresh conversation —
+ *    continuity is sacrificed for the cross-mode turn but recovers naturally
+ *    on subsequent same-mode turns once new ds-sig blocks accumulate.
+ *  • If no strip is needed (all surviving blocks are DeepSeek-shaped or none
+ *    existed), KEEP parsed.thinking so DeepSeek continues its reasoning.
  */
 function processDeepseekRequest(body, state, reqId) {
     try {
         const parsed = JSON.parse(body);
+        // First pass: detect foreign-sig blocks
+        const probe = filterThinkingBlocks(
+            JSON.parse(JSON.stringify(parsed)),
+            block => isLikelyDeepseekSignature(block.signature)
+        );
+        let kept = 0, stripped = 0;
+        if (probe.stripped > 0) {
+            // Clean break: strip ALL thinking blocks (kept + foreign)
+            const r = filterThinkingBlocks(parsed, () => false);
+            stripped = r.stripped;
+            console.log(`[MODEL-PROXY] #${reqId} clean-break strip: removed all ${stripped} thinking blocks (${probe.stripped} foreign-sig + ${probe.kept} same-sig) — DeepSeek continuity unrecoverable`);
+            if (parsed.thinking !== undefined) {
+                const shape = JSON.stringify(parsed.thinking);
+                delete parsed.thinking;
+                console.log(`[MODEL-PROXY] #${reqId} dropped parsed.thinking (clean break, was: ${shape.length > 100 ? shape.slice(0, 100) + '...' : shape})`);
+            }
+        } else {
+            // No foreign-sig blocks; keep deepseek-sig as-is
+            const r = filterThinkingBlocks(parsed, block => isLikelyDeepseekSignature(block.signature));
+            kept = r.kept;
+        }
+        // Post-strip invariant: if any assistant turn lacks a thinking block,
+        // DeepSeek cannot maintain thinking continuity. Explicitly disable
+        // thinking-mode and remove output_config (DS rejects disabled+effort combo).
+        const anyGap = parsed.messages?.some(m =>
+            m.role === 'assistant' &&
+            Array.isArray(m.content) &&
+            m.content.length > 0 &&
+            !m.content.some(b => b.type === 'thinking')
+        );
+        if (anyGap) {
+            parsed.thinking = { type: 'disabled' };
+            delete parsed.output_config;
+            console.log(`[MODEL-PROXY] #${reqId} set thinking=disabled: assistant turn(s) missing thinking block`);
+        }
         const remap = MODEL_REMAP.deepseek;
         if (remap && parsed.model && remap[parsed.model]) {
             const mapped = remap[parsed.model];
             console.log(`[MODEL-PROXY] #${reqId} model remap: ${parsed.model} → ${mapped}`);
             parsed.model = mapped;
-            return Buffer.from(JSON.stringify(parsed));
         }
-        return body;
+        return Buffer.from(JSON.stringify(parsed));
     } catch {
         // Body wasn't JSON — pass through unchanged.
         return body;
@@ -212,10 +324,18 @@ function processOtherBackendRequest(body, state, reqId) {
             changed = true;
         }
 
-        // Strip foreign thinking blocks before forwarding.
+        // Stateless conservative strip: these backends are unvalidated. Drop
+        // ALL thinking blocks and parsed.thinking, regardless of signature.
         const before = JSON.stringify(parsed.messages || null);
         stripAllThinkingBlocks(parsed);
-        if (JSON.stringify(parsed.messages || null) !== before) changed = true;
+        if (JSON.stringify(parsed.messages || null) !== before) {
+            changed = true;
+            console.log(`[MODEL-PROXY] #${reqId} stripped all thinking blocks (PATH C conservative)`);
+        }
+        if (parsed.thinking) {
+            delete parsed.thinking;
+            changed = true;
+        }
 
         return changed ? Buffer.from(JSON.stringify(parsed)) : body;
     } catch {
@@ -254,7 +374,6 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
             // Anthropic uses x-api-key (NOT Bearer); only OpenRouter/Fireworks
             // use Bearer. So if booting in anthropic mode, useBearer is false.
             useBearer: startBackend ? startBackend.useBearer : (anthropicBootKey ? false : initialBearer),
-            hadNonAnthropicSession: !!startBackend,
         };
 
         let reqCount = 0;
@@ -305,6 +424,15 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
 
         function switchMode(name) {
             if (name === 'anthropic') {
+                // Strict path isolation: refuse anthropic-mode switch when no
+                // ANTHROPIC_API_KEY is configured. Subscription OAuth bearers
+                // are rejected by api.anthropic.com ("invalid x-api-key"); the
+                // bridge protocol (which subscription auth needs) is not
+                // implemented in this proxy. Force users to exit and relaunch
+                // in plain claude (no proxy) for a real anthropic session.
+                if (!anthropicApiKey) {
+                    return { error: 'anthropic mode unavailable: no ANTHROPIC_API_KEY set. To use Anthropic, exit this session and run: deepclaude -b anthropic (or set ANTHROPIC_API_KEY env and relaunch).' };
+                }
                 const prev = state.mode;
                 state.mode = 'anthropic';
                 state.target = new URL(ANTHROPIC_FALLBACK);
@@ -323,7 +451,6 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
             state.target = b.target;
             state.apiKey = b.apiKey;
             state.useBearer = b.useBearer;
-            state.hadNonAnthropicSession = true;
             return { mode: name, previous: prev };
         }
 
@@ -430,6 +557,11 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
 
             const headers = { ...clientReq.headers, host: dest.host };
             delete headers['content-length'];
+            // Strip accept-encoding so upstream sends plain text. The
+            // UsageNormalizer Transform stream calls .toString() on incoming
+            // chunks, which corrupts gzip-encoded bytes. Forcing identity
+            // encoding upstream keeps the stream text-clean.
+            delete headers['accept-encoding'];
 
             // Auth substitution per active path. If state.apiKey is set
             // (because the user configured DEEPSEEK_API_KEY / ANTHROPIC_API_KEY
@@ -514,14 +646,14 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                     // thinking-block stripping. The JSONL Claude Code persists
                     // for a backend session reflects that backend's actual
                     // output — that's by design.
-                    if (isModelCall && isSSE) {
+                    if ((isModelCall || isAnthropicModelCall) && isSSE) {
                         clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
                         const norm = new UsageNormalizer((inp, out) => recordUsage(state.mode, inp, out));
                         proxyRes.pipe(norm).pipe(clientRes);
                         proxyRes.on('end', () => {
                             console.log(`[MODEL-PROXY] #${reqId} done in ${((Date.now() - t0) / 1000).toFixed(1)}s (${norm._inputTokens}in/${norm._outputTokens}out)`);
                         });
-                    } else if (isModelCall && ct.includes('application/json')) {
+                    } else if ((isModelCall || isAnthropicModelCall) && ct.includes('application/json')) {
                         const respChunks = [];
                         proxyRes.on('data', c => respChunks.push(c));
                         proxyRes.on('end', () => {

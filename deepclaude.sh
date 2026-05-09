@@ -78,10 +78,14 @@ resolve_backend() {
 }
 
 set_model_env() {
-    export ANTHROPIC_DEFAULT_OPUS_MODEL="$RESOLVED_OPUS"
-    export ANTHROPIC_DEFAULT_SONNET_MODEL="$RESOLVED_SONNET"
-    export ANTHROPIC_DEFAULT_HAIKU_MODEL="$RESOLVED_HAIKU"
-    export CLAUDE_CODE_SUBAGENT_MODEL="$RESOLVED_SUBAGENT"
+    # Use canonical Claude model names. Proxy MODEL_REMAP forward-maps to
+    # backend-native IDs (deepseek-v4-pro etc) for non-anthropic modes;
+    # anthropic mode passes through unchanged. This makes mid-session
+    # /anthropic /deepseek /openrouter /fireworks switches all work.
+    export ANTHROPIC_DEFAULT_OPUS_MODEL="claude-opus-4-7"
+    export ANTHROPIC_DEFAULT_SONNET_MODEL="claude-sonnet-4-6"
+    export ANTHROPIC_DEFAULT_HAIKU_MODEL="claude-haiku-4-5"
+    export CLAUDE_CODE_SUBAGENT_MODEL="claude-opus-4-7"
     export CLAUDE_CODE_EFFORT_LEVEL="max"
 }
 
@@ -207,17 +211,55 @@ launch_claude() {
 
     resolve_backend
 
-    echo "  Launching Claude Code via $BACKEND..."
-    echo "  Endpoint: $RESOLVED_URL"
+    # Path 2: cheap backend via proxy (subscription-friendly).
+    # Spawns the model proxy on 3200 (auto-increments if busy).
+    # CRITICAL: do NOT export ANTHROPIC_AUTH_TOKEN. Let the user's
+    # existing auth (subscription OAuth or ANTHROPIC_API_KEY) flow
+    # through. The proxy substitutes the backend's API key per request,
+    # so client auth is irrelevant for non-anthropic /v1/messages calls.
+    echo "  Starting model proxy for $BACKEND..."
+    if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
+        echo "  Note: /anthropic mid-session switch unavailable (no ANTHROPIC_API_KEY)."
+        echo "        For anthropic mode, exit and run: deepclaude -b anthropic"
+    fi
+
+    local port_file
+    port_file=$(mktemp)
+    # Tee proxy stdout to /tmp/proxy.log so we can diagnose failures after the fact.
+    node "$SCRIPT_DIR/proxy/start-proxy.js" "$RESOLVED_URL" "$RESOLVED_KEY" 2>&1 | tee /tmp/proxy.log > "$port_file" &
+    PROXY_PID=$!
+
+    local tries=0 proxy_port=""
+    while [[ -z "$proxy_port" ]] && [[ $tries -lt 30 ]]; do
+        sleep 0.2
+        proxy_port=$(grep -oE '^[0-9]+$' "$port_file" 2>/dev/null | head -1 || true)
+        tries=$((tries + 1))
+    done
+    rm -f "$port_file"
+    if [[ -z "$proxy_port" ]]; then
+        echo "ERROR: Proxy failed to start (port not detected)" >&2
+        exit 1
+    fi
+
+    # Switch proxy to chosen backend (legacy startup defaults to anthropic).
+    case "$BACKEND" in
+        ds) curl -sX POST "http://127.0.0.1:$proxy_port/_proxy/mode" -d "backend=deepseek" >/dev/null 2>&1 ;;
+        or) curl -sX POST "http://127.0.0.1:$proxy_port/_proxy/mode" -d "backend=openrouter" >/dev/null 2>&1 ;;
+        fw) curl -sX POST "http://127.0.0.1:$proxy_port/_proxy/mode" -d "backend=fireworks" >/dev/null 2>&1 ;;
+    esac
+
+    echo "  Proxy on :$proxy_port -> $RESOLVED_URL ($BACKEND)"
     echo "  Model: $RESOLVED_OPUS (main) + $RESOLVED_HAIKU (subagents)"
+    echo "  Auth: passthrough (subscription OAuth or ANTHROPIC_API_KEY)"
     echo ""
 
-    export ANTHROPIC_BASE_URL="$RESOLVED_URL"
-    export ANTHROPIC_AUTH_TOKEN="$RESOLVED_KEY"
+    export ANTHROPIC_BASE_URL="http://127.0.0.1:$proxy_port"
     set_model_env
-    unset ANTHROPIC_API_KEY
+    # No export of ANTHROPIC_AUTH_TOKEN. No unset of ANTHROPIC_API_KEY:
+    # claude will use whichever it has; proxy already inherited the env.
 
-    exec claude "$@"
+    # NOT exec: the trap needs to fire on exit to kill the proxy.
+    claude "$@"
 }
 
 launch_remote() {
@@ -234,26 +276,29 @@ launch_remote() {
 
     echo "  Starting model proxy for $BACKEND..."
 
+    if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
+        echo "  WARN: ANTHROPIC_API_KEY not set -- /anthropic mid-session switch will 401."
+        echo "        Set with: export ANTHROPIC_API_KEY=sk-ant-..."
+    fi
+
     local port_file
     port_file=$(mktemp)
     node "$SCRIPT_DIR/proxy/start-proxy.js" "$RESOLVED_URL" "$RESOLVED_KEY" > "$port_file" &
     PROXY_PID=$!
 
-    local tries=0
-    while [[ ! -s "$port_file" ]] && [[ $tries -lt 30 ]]; do
+    local tries=0 proxy_port=""
+    while [[ -z "$proxy_port" ]] && [[ $tries -lt 30 ]]; do
         sleep 0.2
+        # Proxy stdout contains banner first, then port number on its own line.
+        # Match a line containing ONLY digits, take first such line.
+        proxy_port=$(grep -oE '^[0-9]+$' "$port_file" 2>/dev/null | head -1 || true)
         tries=$((tries + 1))
     done
-
-    if [[ ! -s "$port_file" ]]; then
-        echo "ERROR: Proxy failed to start" >&2
-        rm -f "$port_file"
+    rm -f "$port_file"
+    if [[ -z "$proxy_port" ]]; then
+        echo "ERROR: Proxy failed to start (port not detected)" >&2
         exit 1
     fi
-
-    local proxy_port
-    proxy_port=$(head -1 "$port_file")
-    rm -f "$port_file"
 
     echo "  Proxy on :$proxy_port -> $RESOLVED_URL"
     echo "  Launching remote control via $BACKEND..."
