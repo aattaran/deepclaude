@@ -242,11 +242,18 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
         const initialName = defaultMode || (backends ? 'anthropic' : null);
         const startBackend = initialName && initialName !== 'anthropic' && allBackends[initialName];
 
+        // If the proxy boots in anthropic mode AND ANTHROPIC_API_KEY is set in
+        // the env, populate apiKey from there so the auth-substitution path
+        // works from the first request without needing a /_proxy/mode flip.
+        const anthropicBootKey = (initialName === 'anthropic' && process.env.ANTHROPIC_API_KEY) || null;
+
         const state = {
             mode: initialName || '_single',
             target: startBackend ? startBackend.target : initialTarget,
-            apiKey: startBackend ? startBackend.apiKey : apiKey,
-            useBearer: startBackend ? startBackend.useBearer : initialBearer,
+            apiKey: startBackend ? startBackend.apiKey : (anthropicBootKey || apiKey),
+            // Anthropic uses x-api-key (NOT Bearer); only OpenRouter/Fireworks
+            // use Bearer. So if booting in anthropic mode, useBearer is false.
+            useBearer: startBackend ? startBackend.useBearer : (anthropicBootKey ? false : initialBearer),
             hadNonAnthropicSession: !!startBackend,
         };
 
@@ -288,12 +295,23 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
             };
         }
 
+        // Anthropic-side auth: optional. If ANTHROPIC_API_KEY is set in the
+        // proxy's process env, the proxy will INJECT it as the auth header on
+        // requests in anthropic mode (same substitution as for non-anthropic
+        // backends, completing the path-isolation story for auth too). If
+        // unset, the proxy passes the client's existing auth header through
+        // unchanged (transparent passthrough — useful for OAuth bridge).
+        const anthropicApiKey = process.env.ANTHROPIC_API_KEY || null;
+
         function switchMode(name) {
             if (name === 'anthropic') {
                 const prev = state.mode;
                 state.mode = 'anthropic';
                 state.target = new URL(ANTHROPIC_FALLBACK);
-                state.apiKey = null;
+                state.apiKey = anthropicApiKey;
+                // Anthropic auth uses the x-api-key header (NOT Bearer).
+                // Bearer is reserved for OAuth bridge sessions, which are
+                // never set up via ANTHROPIC_API_KEY env var.
                 state.useBearer = false;
                 return { mode: 'anthropic', previous: prev };
             }
@@ -413,7 +431,19 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
             const headers = { ...clientReq.headers, host: dest.host };
             delete headers['content-length'];
 
-            if (isModelCall) {
+            // Auth substitution per active path. If state.apiKey is set
+            // (because the user configured DEEPSEEK_API_KEY / ANTHROPIC_API_KEY
+            // / OPENROUTER_API_KEY / FIREWORKS_API_KEY in the proxy's env),
+            // strip the client's auth headers and inject the path-appropriate
+            // key. This makes mode switching seamless: Claude Code's
+            // ANTHROPIC_AUTH_TOKEN can be any value (even a wrong one); the
+            // proxy substitutes the right key per mode.
+            //
+            // If state.apiKey is null (typically anthropic mode without
+            // ANTHROPIC_API_KEY set), the client's auth header is forwarded
+            // unchanged — useful for OAuth bridge mode where Claude Code
+            // already holds a valid Anthropic session token.
+            if (MODEL_PATHS.includes(urlPath) && state.apiKey) {
                 delete headers['authorization'];
                 delete headers['x-api-key'];
                 if (state.useBearer) {
