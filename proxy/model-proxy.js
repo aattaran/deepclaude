@@ -122,6 +122,108 @@ function stripUnsignedThinkingBlocks(body) {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// PER-PATH REQUEST PROCESSORS
+//
+// Each function owns the full request-side transformation for its path. There
+// is NO shared "if (mode === X)" sanitization logic outside these functions —
+// the dispatcher picks one and runs it. Adding a new backend means adding a
+// new processor + wiring it into the dispatcher; existing paths stay untouched.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * PATH A — Anthropic (state.mode === 'anthropic')
+ *
+ * Forwarding to api.anthropic.com.
+ *  • If the conversation history contains turns from a non-Anthropic backend
+ *    (state.hadNonAnthropicSession), strip ALL thinking blocks. Foreign
+ *    backends generate signed-but-invalid blocks that pass the unsigned
+ *    filter and trip Anthropic 400s.
+ *  • Otherwise, strip only UNSIGNED thinking blocks (Anthropic's normal
+ *    requirement — its own signed blocks are valid and must be passed back).
+ *  • No model remap.
+ */
+function processAnthropicRequest(body, state, reqId) {
+    try {
+        const parsed = JSON.parse(body);
+        if (state.hadNonAnthropicSession) {
+            stripAllThinkingBlocks(parsed);
+        } else {
+            stripUnsignedThinkingBlocks(parsed);
+        }
+        return Buffer.from(JSON.stringify(parsed));
+    } catch {
+        // Body wasn't JSON — pass through unchanged.
+        return body;
+    }
+}
+
+/**
+ * PATH B — DeepSeek (state.mode === 'deepseek')
+ *
+ * Forwarding to DeepSeek's Anthropic-compat endpoint.
+ *  • Apply MODEL_REMAP['deepseek'] to the `model` field.
+ *  • DO NOT strip thinking blocks. DeepSeek's endpoint REQUIRES prior
+ *    thinking blocks to be passed back when the request includes
+ *    thinking-mode parameters; absence returns 400 with
+ *    "content[].thinking ... must be passed back".
+ *  • The JSONL Claude Code persists will reflect real DeepSeek content
+ *    (foreign-signed thinking, deepseek-v4-pro model name). That is by
+ *    design — a DeepSeek session is a DeepSeek session.
+ */
+function processDeepseekRequest(body, state, reqId) {
+    try {
+        const parsed = JSON.parse(body);
+        const remap = MODEL_REMAP.deepseek;
+        if (remap && parsed.model && remap[parsed.model]) {
+            const mapped = remap[parsed.model];
+            console.log(`[MODEL-PROXY] #${reqId} model remap: ${parsed.model} → ${mapped}`);
+            parsed.model = mapped;
+            return Buffer.from(JSON.stringify(parsed));
+        }
+        return body;
+    } catch {
+        // Body wasn't JSON — pass through unchanged.
+        return body;
+    }
+}
+
+/**
+ * PATH C — Other non-Anthropic backends (openrouter, fireworks, _single)
+ *
+ * Forwarding to the configured backend.
+ *  • Apply MODEL_REMAP[mode] if defined for this mode.
+ *  • Strip ALL thinking blocks. These backends are assumed to reject
+ *    foreign-signed thinking blocks (the original deepclaude assumption).
+ *    We have NOT validated whether any of them require continuity like
+ *    DeepSeek does. If a future backend turns out to need pass-through,
+ *    promote it to its own dedicated path (do not weaken this one).
+ */
+function processOtherBackendRequest(body, state, reqId) {
+    try {
+        const parsed = JSON.parse(body);
+        let changed = false;
+
+        const remap = MODEL_REMAP[state.mode];
+        if (remap && parsed.model && remap[parsed.model]) {
+            const mapped = remap[parsed.model];
+            console.log(`[MODEL-PROXY] #${reqId} model remap: ${parsed.model} → ${mapped}`);
+            parsed.model = mapped;
+            changed = true;
+        }
+
+        // Strip foreign thinking blocks before forwarding.
+        const before = JSON.stringify(parsed.messages || null);
+        stripAllThinkingBlocks(parsed);
+        if (JSON.stringify(parsed.messages || null) !== before) changed = true;
+
+        return changed ? Buffer.from(JSON.stringify(parsed)) : body;
+    } catch {
+        // Body wasn't JSON — pass through unchanged.
+        return body;
+    }
+}
+
 export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends, defaultMode }) {
     return new Promise((resolve, reject) => {
         const initialTarget = new URL(targetUrl);
@@ -270,9 +372,20 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                 return;
             }
 
-            // In anthropic mode, everything passes through transparently
+            // ─────────────────────────────────────────────────────────────
+            // Decide ONCE which path this request takes. After this point,
+            // no shared sanitization branches exist — each path is handled
+            // by its own processor function.
+            // ─────────────────────────────────────────────────────────────
             const isAnthropicMode = state.mode === 'anthropic';
+            // A "model call" is a /v1/messages request to a NON-Anthropic
+            // backend (i.e. PATH B or PATH C). Anthropic-mode /v1/messages
+            // calls are still proxied to api.anthropic.com but flagged
+            // separately because they use a different upstream (the
+            // ANTHROPIC_FALLBACK target, not state.target) and skip the
+            // backend auth header / model remap entirely.
             const isModelCall = !isAnthropicMode && MODEL_PATHS.includes(urlPath);
+            const isAnthropicModelCall = isAnthropicMode && MODEL_PATHS.includes(urlPath);
             const dest = isModelCall ? state.target : new URL(ANTHROPIC_FALLBACK);
 
             // Build upstream path. target.pathname may overlap with
@@ -315,42 +428,28 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
             clientReq.on('end', () => {
                 let body = Buffer.concat(chunks);
 
-                // Remap Anthropic model names to backend-specific names
-                if (isModelCall && MODEL_REMAP[state.mode]) {
-                    try {
-                        const parsed = JSON.parse(body);
-                        const mapped = MODEL_REMAP[state.mode][parsed.model];
-                        if (mapped) {
-                            console.log(`[MODEL-PROXY] #${reqId} model remap: ${parsed.model} → ${mapped}`);
-                            parsed.model = mapped;
-                            body = Buffer.from(JSON.stringify(parsed));
-                        }
-                    } catch { /* not JSON or parse error, pass through */ }
-                }
-
-                // Strip thinking blocks before forwarding.
-                // Non-Anthropic: strip ALL blocks — backends reject thinking blocks
-                // they didn't generate, even unsigned ones.
-                // Anthropic after a non-Anthropic session: also strip ALL, because
-                // foreign backends generate signed-but-invalid thinking blocks that
-                // stripUnsignedThinkingBlocks passes through, causing Anthropic 400s.
-                if (isAnthropicMode && MODEL_PATHS.includes(urlPath)) {
-                    try {
-                        const parsed = JSON.parse(body);
-                        if (state.hadNonAnthropicSession) {
-                            stripAllThinkingBlocks(parsed);
-                        } else {
-                            stripUnsignedThinkingBlocks(parsed);
-                        }
-                        body = Buffer.from(JSON.stringify(parsed));
-                    } catch { /* pass through */ }
-                }
-                if (isModelCall) {
-                    try {
-                        const parsed = JSON.parse(body);
-                        stripAllThinkingBlocks(parsed);
-                        body = Buffer.from(JSON.stringify(parsed));
-                    } catch { /* pass through */ }
+                // ─────────────────────────────────────────────────────────
+                // Dispatch to ONE per-path request processor. Each processor
+                // owns all sanitization for its path — no shared logic.
+                //
+                //   PATH A — Anthropic         : strip thinking (signed?
+                //                                depends on prior session),
+                //                                no model remap.
+                //   PATH B — DeepSeek          : remap model only,
+                //                                NEVER strip thinking
+                //                                (endpoint requires it).
+                //   PATH C — Other non-Anthr.  : remap model + strip ALL
+                //                                thinking blocks.
+                //   (non-/v1/messages traffic in non-Anthropic mode and all
+                //    non-/v1/messages traffic in Anthropic mode bypasses
+                //    request-body processing entirely — pure passthrough.)
+                // ─────────────────────────────────────────────────────────
+                if (isAnthropicModelCall) {
+                    body = processAnthropicRequest(body, state, reqId);
+                } else if (isModelCall && state.mode === 'deepseek') {
+                    body = processDeepseekRequest(body, state, reqId);
+                } else if (isModelCall) {
+                    body = processOtherBackendRequest(body, state, reqId);
                 }
 
                 const opts = {
@@ -379,6 +478,12 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                     const ct = proxyRes.headers['content-type'] || '';
                     const isSSE = ct.includes('text/event-stream');
 
+                    // Response path: pass-through for ALL paths. UsageNormalizer
+                    // for SSE (Claude-Code crash guard); normalizeJsonBody for
+                    // non-streaming JSON (same guard). No model un-mapping. No
+                    // thinking-block stripping. The JSONL Claude Code persists
+                    // for a backend session reflects that backend's actual
+                    // output — that's by design.
                     if (isModelCall && isSSE) {
                         clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
                         const norm = new UsageNormalizer((inp, out) => recordUsage(state.mode, inp, out));
