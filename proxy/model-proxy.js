@@ -25,11 +25,11 @@ const MODEL_REMAP = {
 };
 
 const PRICING_PER_M = {
-    deepseek:   { input: 0.44,  output: 0.87 },
-    openrouter: { input: 0.44,  output: 0.87 },
+    deepseek:   { input: 0.44,  output: 0.87,  cacheHit: 0.003625 },
+    openrouter: { input: 0.44,  output: 0.87,  cacheHit: 0.003625 },
     fireworks:  { input: 1.74,  output: 3.48 },
     anthropic:  { input: 3.00,  output: 15.00 },
-    _single:    { input: 0.44,  output: 0.87 },
+    _single:    { input: 0.44,  output: 0.87,  cacheHit: 0.003625 },
 };
 
 /**
@@ -44,6 +44,8 @@ class UsageNormalizer extends Transform {
         this._onUsage = onUsage;
         this._inputTokens = 0;
         this._outputTokens = 0;
+        this._cacheCreationTokens = 0;
+        this._cacheReadTokens = 0;
     }
 
     _transform(chunk, _enc, cb) {
@@ -65,6 +67,8 @@ class UsageNormalizer extends Transform {
             if (d.type === 'message_start' && d.message) {
                 if (d.message.usage) {
                     this._inputTokens = d.message.usage.input_tokens || 0;
+                    this._cacheCreationTokens = d.message.usage.cache_creation_input_tokens || 0;
+                    this._cacheReadTokens = d.message.usage.cache_read_input_tokens || 0;
                 } else {
                     d.message.usage = { input_tokens: 0, output_tokens: 0 };
                     changed = true;
@@ -85,7 +89,7 @@ class UsageNormalizer extends Transform {
 
     _flush(cb) {
         if (this._buf.trim()) this.push(this._fix(this._buf) + '\n\n');
-        if (this._onUsage) this._onUsage(this._inputTokens, this._outputTokens);
+        if (this._onUsage) this._onUsage(this._inputTokens, this._outputTokens, this._cacheCreationTokens, this._cacheReadTokens);
         cb();
     }
 }
@@ -104,11 +108,55 @@ function normalizeJsonBody(buf) {
     return buf;
 }
 
+// Lone UTF-16 surrogate scrub. Claude Code can emit a half surrogate pair in
+// a string field; non-Anthropic backends 400 on it. Replace with U+FFFD.
+const LONE_SURROGATE_RE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
+
+function sanitizeJsonStrings(val) {
+    if (typeof val === 'string') return val.replace(LONE_SURROGATE_RE, '�');
+    if (Array.isArray(val)) return val.map(sanitizeJsonStrings);
+    if (val && typeof val === 'object') {
+        const out = {};
+        for (const k of Object.keys(val)) out[k] = sanitizeJsonStrings(val[k]);
+        return out;
+    }
+    return val;
+}
+
+function sanitizeRequestBody(buf) {
+    try {
+        const obj = JSON.parse(buf.toString());
+        const clean = sanitizeJsonStrings(obj);
+        return Buffer.from(JSON.stringify(clean));
+    } catch { /* not JSON — pass through as-is */ }
+    return buf;
+}
+
+function stripBlocks(arr) {
+    if (!Array.isArray(arr)) return arr;
+    return arr.filter(b => {
+        if (!b) return false;          // null/undefined content blocks are invalid
+        return b.type !== 'thinking';
+    });
+}
+
+function stripUnsignedBlocks(arr) {
+    if (!Array.isArray(arr)) return arr;
+    return arr.filter(b => {
+        if (!b) return false;          // null/undefined content blocks are invalid
+        return b.type !== 'thinking' || b.signature;
+    });
+}
+
 function stripAllThinkingBlocks(body) {
     if (!body?.messages) return;
     for (const msg of body.messages) {
         if (!Array.isArray(msg.content)) continue;
-        msg.content = msg.content.filter(b => b.type !== 'thinking');
+        msg.content = stripBlocks(msg.content);
+    }
+    // system can be an array of content blocks (supported by Anthropic API)
+    if (Array.isArray(body.system)) {
+        body.system = stripBlocks(body.system);
     }
 }
 
@@ -116,9 +164,10 @@ function stripUnsignedThinkingBlocks(body) {
     if (!body?.messages) return;
     for (const msg of body.messages) {
         if (!Array.isArray(msg.content)) continue;
-        msg.content = msg.content.filter(
-            block => block.type !== 'thinking' || block.signature
-        );
+        msg.content = stripUnsignedBlocks(msg.content);
+    }
+    if (Array.isArray(body.system)) {
+        body.system = stripUnsignedBlocks(body.system);
     }
 }
 
@@ -380,10 +429,12 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
         const t0Global = Date.now();
         const costs = {};
 
-        function recordUsage(backend, inputTokens, outputTokens) {
-            if (!costs[backend]) costs[backend] = { input: 0, output: 0, requests: 0 };
+        function recordUsage(backend, inputTokens, outputTokens, cacheCreation = 0, cacheRead = 0) {
+            if (!costs[backend]) costs[backend] = { input: 0, output: 0, cacheCreation: 0, cacheRead: 0, requests: 0 };
             costs[backend].input += inputTokens || 0;
             costs[backend].output += outputTokens || 0;
+            costs[backend].cacheCreation += cacheCreation || 0;
+            costs[backend].cacheRead += cacheRead || 0;
             costs[backend].requests++;
         }
 
@@ -394,13 +445,17 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
             for (const [backend, tokens] of Object.entries(costs)) {
                 const p = PRICING_PER_M[backend] || PRICING_PER_M._single;
                 const ap = PRICING_PER_M.anthropic;
-                const actual = (tokens.input * p.input + tokens.output * p.output) / 1_000_000;
+                const cacheHitPrice = p.cacheHit || p.input;
+                const cacheMissTokens = tokens.input - (tokens.cacheRead || 0);
+                const actual = (cacheMissTokens * p.input + (tokens.cacheRead || 0) * cacheHitPrice + tokens.output * p.output) / 1_000_000;
                 const anthropicEq = (tokens.input * ap.input + tokens.output * ap.output) / 1_000_000;
                 totalActual += actual;
                 totalAnthropic += anthropicEq;
                 summary[backend] = {
                     input_tokens: tokens.input,
                     output_tokens: tokens.output,
+                    cache_read_tokens: tokens.cacheRead || 0,
+                    cache_creation_tokens: tokens.cacheCreation || 0,
                     requests: tokens.requests,
                     cost: +actual.toFixed(4),
                     anthropic_equivalent: +anthropicEq.toFixed(4),
@@ -474,8 +529,23 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                     return;
                 }
                 if (urlPath === '/_proxy/mode' && clientReq.method === 'POST') {
+                    // CSRF guard: the proxy binds to 127.0.0.1 but a malicious
+                    // page at e.g. http://127.0.0.1.evil.com (DNS to attacker)
+                    // would pass a startsWith() check. Parse the Origin and
+                    // match the host exactly (any port).
+                    // No Origin header (curl / the in-session slash-command
+                    // path) is allowed — only browsers send Origin, and the
+                    // CSRF/DNS-rebind threat is a *present* hostile Origin.
                     const origin = clientReq.headers['origin'] || '';
-                    if (origin && !origin.startsWith('http://127.0.0.1') && !origin.startsWith('http://localhost')) {
+                    let originOk = !origin;
+                    if (origin) {
+                        try {
+                            const u = new URL(origin);
+                            originOk = u.protocol === 'http:'
+                                && (u.hostname === '127.0.0.1' || u.hostname === 'localhost');
+                        } catch { /* malformed origin — reject */ }
+                    }
+                    if (!originOk) {
                         clientRes.writeHead(403, { 'content-type': 'application/json' });
                         clientRes.end(JSON.stringify({ error: 'Forbidden' }));
                         return;
@@ -489,7 +559,7 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                     });
                     clientReq.on('end', () => {
                         const body = Buffer.concat(chunks).toString();
-                        const m = body.match(/backend=([a-z]+)/);
+                        const m = body.match(/backend=([a-z][a-z0-9_-]*)/);
                         if (!m) {
                             clientRes.writeHead(400, { 'content-type': 'application/json' });
                             clientRes.end(JSON.stringify({ error: 'Missing backend= in body' }));
@@ -562,6 +632,11 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
             // chunks, which corrupts gzip-encoded bytes. Forcing identity
             // encoding upstream keeps the stream text-clean.
             delete headers['accept-encoding'];
+            // Hop-by-hop / loopback-only headers must not reach the upstream:
+            // a forwarded transfer-encoding desyncs framing (we set our own
+            // content-length); origin is a loopback artifact of /_proxy/* CSRF.
+            delete headers['transfer-encoding'];
+            delete headers['origin'];
 
             // Auth substitution per active path. If state.apiKey is set
             // (because the user configured DEEPSEEK_API_KEY / ANTHROPIC_API_KEY
@@ -589,6 +664,11 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
             clientReq.on('data', c => chunks.push(c));
             clientReq.on('end', () => {
                 let body = Buffer.concat(chunks);
+
+                // Scrub lone UTF-16 surrogates before any path processes the
+                // body — invalid surrogates make non-Anthropic backends 400.
+                // No-op for non-JSON bodies and for well-formed JSON.
+                if (MODEL_PATHS.includes(urlPath)) body = sanitizeRequestBody(body);
 
                 // ─────────────────────────────────────────────────────────
                 // Dispatch to ONE per-path request processor. Each processor
@@ -648,7 +728,7 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                     // output — that's by design.
                     if ((isModelCall || isAnthropicModelCall) && isSSE) {
                         clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
-                        const norm = new UsageNormalizer((inp, out) => recordUsage(state.mode, inp, out));
+                        const norm = new UsageNormalizer((inp, out, cc, cr) => recordUsage(state.mode, inp, out, cc, cr));
                         proxyRes.pipe(norm).pipe(clientRes);
                         proxyRes.on('end', () => {
                             console.log(`[MODEL-PROXY] #${reqId} done in ${((Date.now() - t0) / 1000).toFixed(1)}s (${norm._inputTokens}in/${norm._outputTokens}out)`);
@@ -661,7 +741,7 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                             const fixed = normalizeJsonBody(raw);
                             try {
                                 const j = JSON.parse(fixed);
-                                if (j.usage) recordUsage(state.mode, j.usage.input_tokens, j.usage.output_tokens);
+                                if (j.usage) recordUsage(state.mode, j.usage.input_tokens, j.usage.output_tokens, j.usage.cache_creation_input_tokens, j.usage.cache_read_input_tokens);
                             } catch {}
                             const outHeaders = { ...proxyRes.headers, 'content-length': fixed.length };
                             clientRes.writeHead(proxyRes.statusCode, outHeaders);
@@ -722,3 +802,20 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
         tryListen(startPort);
     });
 }
+
+// ─── Crash guard (module-level, registered once) ─────────────────
+// A single malformed upstream chunk or rejected promise must not take the
+// proxy down mid-session. Fatal memory/system errors still exit.
+if (!process.listenerCount('uncaughtException')) {
+    process.on('uncaughtException', (err) => {
+        if (err instanceof RangeError || err.code === 'ERR_SYSTEM_ERROR') process.exit(1);
+        console.error(`[MODEL-PROXY] UNCAUGHT EXCEPTION (process kept alive): ${err.stack || err.message || err}`);
+    });
+}
+if (!process.listenerCount('unhandledRejection')) {
+    process.on('unhandledRejection', (reason) => {
+        console.error(`[MODEL-PROXY] UNHANDLED REJECTION (process kept alive): ${reason?.stack || reason?.message || reason}`);
+    });
+}
+
+export { stripAllThinkingBlocks, stripUnsignedThinkingBlocks, stripBlocks, stripUnsignedBlocks, sanitizeJsonStrings, sanitizeRequestBody };
