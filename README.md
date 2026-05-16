@@ -274,6 +274,8 @@ Returns:
     "deepseek": {
       "input_tokens": 125000,
       "output_tokens": 45000,
+      "cache_read_tokens": 30000,
+      "cache_creation_tokens": 0,
       "requests": 12,
       "cost": 0.0941,
       "anthropic_equivalent": 1.05
@@ -284,6 +286,43 @@ Returns:
   "savings": 0.9559
 }
 ```
+
+### Cache-aware cost accounting
+
+Cost tracking now separates **cached input** from fresh input. Cache-read
+tokens (DeepSeek/Anthropic automatic context caching) are billed at the
+cache-hit rate (`$0.003625/M` for the DeepSeek family) instead of the full
+input rate, so reported `cost` and `savings` reflect real agent-loop spend
+where most of the system prompt + file context is a cache hit after turn 1.
+The `/_proxy/cost` response exposes `cache_read_tokens` and
+`cache_creation_tokens` per backend.
+
+## Reliability & security
+
+The proxy carries a set of hardening measures so a single bad request or a
+hostile local page can't corrupt a session or take the proxy down:
+
+- **Lone-surrogate scrub.** Request bodies are sanitized for unpaired UTF-16
+  surrogates (a malformed `\uD800`-class code unit) before forwarding —
+  non-Anthropic backends reject these with a 400 otherwise. No-op for
+  well-formed JSON and non-JSON bodies.
+- **CSRF / DNS-rebind guard on `/_proxy/mode`.** The control endpoint parses
+  the `Origin` header and matches the host *exactly* against `127.0.0.1` /
+  `localhost` (a `http://127.0.0.1.evil.com` page no longer slips past a
+  prefix check). Requests with no `Origin` (curl, the in-session slash
+  commands) are still allowed — only a *present, hostile* Origin is rejected.
+- **Header hygiene.** `accept-encoding`, `transfer-encoding`, and `origin`
+  are stripped before the upstream request so framing and the usage stream
+  stay clean.
+- **Null / array-system thinking-block handling.** Thinking-block stripping
+  also covers `system` arrays and skips null content blocks (both are
+  invalid to forward).
+- **Crash guard.** Module-level `uncaughtException` / `unhandledRejection`
+  handlers keep the proxy alive through a malformed upstream chunk or a
+  stray rejection; only fatal memory/system errors exit.
+
+These do not change any backend routing or the locked DeepSeek path —
+they are defensive additions around it.
 
 ## VS Code / Cursor integration
 
