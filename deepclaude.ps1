@@ -41,6 +41,9 @@ $OpenRouterKey = if ($env:OPENROUTER_API_KEY) { $env:OPENROUTER_API_KEY } else {
 $FireworksKey = if ($env:FIREWORKS_API_KEY) { $env:FIREWORKS_API_KEY } else {
     [Environment]::GetEnvironmentVariable("FIREWORKS_API_KEY", "User")
 }
+$GeminiKey = if ($env:GEMINI_API_KEY) { $env:GEMINI_API_KEY } else {
+    [Environment]::GetEnvironmentVariable("GEMINI_API_KEY", "User")
+}
 
 $Providers = @{
     ds = @{
@@ -66,6 +69,15 @@ $Providers = @{
         haiku = "accounts/fireworks/models/deepseek-v4-pro"
         subagent = "accounts/fireworks/models/deepseek-v4-pro"
     }
+    gemini = @{
+        name = "Gemini 3.5 Flash (Google)"
+        url = "https://generativelanguage.googleapis.com"
+        key = $GeminiKey; keyName = "GEMINI_API_KEY"
+        opus = "gemini-3.5-flash"
+        sonnet = "gemini-3.5-flash"
+        haiku = "gemini-3.5-flash"
+        subagent = "gemini-3.5-flash"
+    }
 }
 
 function Get-KeyDisplay($k) {
@@ -81,10 +93,12 @@ if ($Status) {
     Write-Host "    DEEPSEEK_API_KEY:    $(Get-KeyDisplay $DeepSeekKey)"
     Write-Host "    OPENROUTER_API_KEY:  $(Get-KeyDisplay $OpenRouterKey)"
     Write-Host "    FIREWORKS_API_KEY:   $(Get-KeyDisplay $FireworksKey)"
+    Write-Host "    GEMINI_API_KEY:      $(Get-KeyDisplay $GeminiKey)"
     Write-Host "`n  Backends:" -ForegroundColor Yellow
     Write-Host "    deepclaude              # DeepSeek V4 Pro (default)"
     Write-Host "    deepclaude -b or        # OpenRouter (cheapest)"
     Write-Host "    deepclaude -b fw        # Fireworks AI (fastest)"
+    Write-Host "    deepclaude -b gemini    # Gemini 3.5 Flash (Google)"
     Write-Host "    deepclaude -b anthropic # Normal Claude Code"
     Write-Host ""
     exit 0
@@ -100,6 +114,7 @@ if ($Cost) {
     Write-Host "  DeepSeek        `$0.44      `$0.87      `$0.004" -ForegroundColor Green
     Write-Host "  OpenRouter      `$0.44      `$0.87      (provider)"
     Write-Host "  Fireworks       `$1.74      `$3.48      (provider)"
+    Write-Host "  Gemini 3.5      `$1.50      `$9.00      `$0.15"
     Write-Host "  Anthropic       `$3.00      `$15.00     `$0.30"
     Write-Host ""
     Write-Host "  Monthly estimate (heavy use): `$30-80 vs `$200 Anthropic" -ForegroundColor Green
@@ -113,7 +128,7 @@ if ($Help) {
     Write-Host ""
     Write-Host "Usage: deepclaude [-b backend] [--status] [--cost] [--benchmark]"
     Write-Host ""
-    Write-Host "  -b, --backend   ds (default), or, fw, anthropic"
+    Write-Host "  -b, --backend   ds (default), or, fw, gemini, anthropic"
     Write-Host "  --status        Show keys and backends"
     Write-Host "  --cost          Pricing comparison"
     Write-Host "  --benchmark     Latency test"
@@ -124,10 +139,14 @@ if ($Help) {
 if ($Benchmark) {
     Write-Host "`n  Latency Benchmark" -ForegroundColor Cyan
     Write-Host "  ==================" -ForegroundColor DarkGray
-    foreach ($id in @("ds","or","fw")) {
+    foreach ($id in @("ds","or","fw","gemini")) {
         $p = $Providers[$id]
         Write-Host "  $($p.name)..." -NoNewline
         if (-not $p.key) { Write-Host " SKIP (no key)" -ForegroundColor DarkGray; continue }
+        if ($id -eq "gemini") {
+            Write-Host " SKIP (non-Anthropic API — use proxy)" -ForegroundColor DarkGray
+            continue
+        }
         $useBearer = $id -in @("or","fw")
         $headers = if ($useBearer) {
             @{ "Authorization" = "Bearer $($p.key)"; "content-type" = "application/json"; "anthropic-version" = "2023-06-01" }
@@ -166,7 +185,7 @@ if ($Remote) {
     }
 
     $p = $Providers[$Backend]
-    if (-not $p) { Write-Host "ERROR: Unknown backend '$Backend'" -ForegroundColor Red; exit 1 }
+    if (-not $p) { Write-Host "ERROR: Unknown backend '$Backend'. Use: ds, or, fw, gemini, anthropic" -ForegroundColor Red; exit 1 }
     if (-not $p.key) { Write-Host "ERROR: $($p.keyName) not set" -ForegroundColor Red; exit 1 }
 
     Write-Host "`n  Starting model proxy for $($p.name)..." -ForegroundColor Cyan
@@ -229,7 +248,7 @@ if ($Backend -eq "anthropic") {
 }
 
 $p = $Providers[$Backend]
-if (-not $p) { Write-Host "ERROR: Unknown backend '$Backend'. Use: ds, or, fw, anthropic" -ForegroundColor Red; exit 1 }
+if (-not $p) { Write-Host "ERROR: Unknown backend '$Backend'. Use: ds, or, fw, gemini, anthropic" -ForegroundColor Red; exit 1 }
 if (-not $p.key) { Write-Host "ERROR: $($p.keyName) not set" -ForegroundColor Red; exit 1 }
 
 Write-Host "`n  Launching Claude Code via $($p.name)..." -ForegroundColor Cyan

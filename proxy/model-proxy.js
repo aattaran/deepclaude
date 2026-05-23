@@ -2,10 +2,56 @@ import { createServer } from 'http';
 import { request as httpsRequest } from 'https';
 import { URL } from 'url';
 import { Transform } from 'stream';
+import { translateRequest, GeminiStreamTranslator, translateNonStreamingResponse } from './gemini-translator.js';
 
 const ANTHROPIC_FALLBACK = 'https://api.anthropic.com';
+const GEMINI_BASE = 'https://generativelanguage.googleapis.com';
 const MODEL_PATHS = ['/v1/messages'];
 const REQUEST_TIMEOUT_MS = 5 * 60 * 1000; // 5 min per request
+const NON_ANTHROPIC_BACKENDS = new Set(['gemini']);
+const HAIKU_PATTERN = /^claude-haiku/;
+
+// Auto-routing: Haiku-tier → Gemini, Opus/Sonnet → DeepSeek
+const AUTO_ROUTE = {
+    haiku:       { primary: 'gemini',   fallback: 'deepseek', fallbackModel: 'deepseek-v4-flash' },
+    sonnet_opus: { primary: 'deepseek', fallback: 'gemini',   fallbackModel: 'gemini-3.5-flash' },
+};
+
+function isHaikuModel(model) { return HAIKU_PATTERN.test(model); }
+
+function resolveAutoBackend(model, backends) {
+    const tier = isHaikuModel(model) ? 'haiku' : 'sonnet_opus';
+    const route = AUTO_ROUTE[tier];
+    const primary = backends[route.primary];
+    const fallback = backends[route.fallback];
+    if (!primary?.apiKey && !fallback?.apiKey) return null;
+
+    // Build context for the chosen primary (or fallback if primary missing)
+    let ctx = null;
+    let fb = null;
+
+    const buildCtx = (name, cfg, remapModel) => ({
+        name,
+        target: cfg.target,
+        apiKey: cfg.apiKey,
+        useBearer: cfg.useBearer,
+        isNonAnthropic: NON_ANTHROPIC_BACKENDS.has(name),
+        model: remapModel,
+    });
+
+    if (primary?.apiKey) {
+        const remap = (MODEL_REMAP[route.primary]?.[model] || model);
+        ctx = buildCtx(route.primary, primary, remap);
+        if (fallback?.apiKey) {
+            fb = buildCtx(route.fallback, fallback, route.fallbackModel);
+        }
+    } else if (fallback?.apiKey) {
+        const remap = (MODEL_REMAP[route.fallback]?.[model] || route.fallbackModel);
+        ctx = buildCtx(route.fallback, fallback, remap);
+    }
+
+    return { ctx, fallback: fb, tier };
+}
 
 const MODEL_REMAP = {
     deepseek: {
@@ -22,12 +68,20 @@ const MODEL_REMAP = {
         'claude-sonnet-4-5-20250929': 'deepseek/deepseek-v4-flash',
         'claude-haiku-4-5-20251001':  'deepseek/deepseek-v4-flash',
     },
+    gemini: {
+        'claude-opus-4-6':    'gemini-3.5-flash',
+        'claude-opus-4-7':    'gemini-3.5-flash',
+        'claude-sonnet-4-6':  'gemini-3.5-flash',
+        'claude-sonnet-4-5-20250929': 'gemini-3.5-flash',
+        'claude-haiku-4-5-20251001':  'gemini-3.5-flash',
+    },
 };
 
 const PRICING_PER_M = {
     deepseek:   { input: 0.44,  output: 0.87 },
     openrouter: { input: 0.44,  output: 0.87 },
     fireworks:  { input: 1.74,  output: 3.48 },
+    gemini:     { input: 1.50,  output: 9.00 },
     anthropic:  { input: 3.00,  output: 15.00 },
     _single:    { input: 0.44,  output: 0.87 },
 };
@@ -148,6 +202,11 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
             hadNonAnthropicSession: !!startBackend,
         };
 
+        // Auto-detect Gemini legacy mode — targetUrl contains generativelanguage
+        if (state.mode === '_single' && state.target.hostname.includes('generativelanguage')) {
+            state.mode = 'gemini';
+        }
+
         let reqCount = 0;
         const t0Global = Date.now();
         const costs = {};
@@ -193,10 +252,24 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                 state.target = new URL(ANTHROPIC_FALLBACK);
                 state.apiKey = null;
                 state.useBearer = false;
+                state.hadNonAnthropicSession = false;
                 return { mode: 'anthropic', previous: prev };
             }
+            if (name === 'auto') {
+                const available = [];
+                if (allBackends.deepseek?.apiKey) available.push('deepseek');
+                if (allBackends.gemini?.apiKey) available.push('gemini');
+                if (available.length === 0) return { error: 'Auto mode requires at least one backend (deepseek or gemini) with API key set.' };
+                const prev = state.mode;
+                state.mode = 'auto';
+                state.target = allBackends.deepseek?.target || allBackends.gemini?.target || new URL('https://api.deepseek.com/anthropic');
+                state.apiKey = allBackends.deepseek?.apiKey || allBackends.gemini?.apiKey;
+                state.useBearer = false;
+                state.hadNonAnthropicSession = true;
+                return { mode: 'auto', previous: prev, available };
+            }
             const b = allBackends[name];
-            if (!b) return { error: `Unknown backend: ${name}. Valid: anthropic, ${Object.keys(allBackends).join(', ')}` };
+            if (!b) return { error: `Unknown backend: ${name}. Valid: anthropic, auto, ${Object.keys(allBackends).join(', ')}` };
             if (!b.apiKey) return { error: `API key not set for ${name}` };
             const prev = state.mode;
             state.mode = name;
@@ -213,12 +286,22 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
             // Control endpoints — /_proxy/* (never collides with /v1/*)
             if (urlPath.startsWith('/_proxy/')) {
                 if (urlPath === '/_proxy/status') {
-                    clientRes.writeHead(200, { 'content-type': 'application/json' });
-                    clientRes.end(JSON.stringify({
+                    const status = {
                         mode: state.mode,
                         uptime: Math.round((Date.now() - t0Global) / 1000),
                         requests: reqCount,
-                    }));
+                    };
+                    if (state.mode === 'auto') {
+                        status.routing = {
+                            haiku: { primary: 'gemini', fallback: 'deepseek' },
+                            sonnet_opus: { primary: 'deepseek', fallback: 'gemini' },
+                        };
+                        status.backends = {};
+                        if (allBackends.deepseek?.apiKey) status.backends.deepseek = 'available';
+                        if (allBackends.gemini?.apiKey) status.backends.gemini = 'available';
+                    }
+                    clientRes.writeHead(200, { 'content-type': 'application/json' });
+                    clientRes.end(JSON.stringify(status));
                     return;
                 }
                 if (urlPath === '/_proxy/cost') {
@@ -270,156 +353,319 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                 return;
             }
 
-            // In anthropic mode, everything passes through transparently
-            const isAnthropicMode = state.mode === 'anthropic';
-            const isModelCall = !isAnthropicMode && MODEL_PATHS.includes(urlPath);
-            const dest = isModelCall ? state.target : new URL(ANTHROPIC_FALLBACK);
-
-            // Build upstream path. target.pathname may overlap with
-            // clientReq.url (e.g. OpenRouter /api/v1 + /v1/messages).
-            // Strip the shared prefix to avoid /api/v1/v1/messages.
-            let fullPath;
-            if (isModelCall) {
-                const base = state.target.pathname.replace(/\/$/, '');
-                let overlap = '';
-                for (let i = 1; i <= Math.min(base.length, urlPath.length); i++) {
-                    if (base.endsWith(urlPath.substring(0, i))) overlap = urlPath.substring(0, i);
-                }
-                fullPath = overlap ? base + urlPath.substring(overlap.length) : base + urlPath;
-            } else {
-                fullPath = clientReq.url;
-            }
-
             const reqId = ++reqCount;
             const t0 = Date.now();
 
-            if (isModelCall) {
-                console.log(`[MODEL-PROXY] #${reqId} → ${dest.hostname}${fullPath}`);
-            }
+            // --- Routing context (overridden for auto mode after body parse) ---
+            const isAnthropicMode = state.mode === 'anthropic';
+            const isModelCall = !isAnthropicMode && MODEL_PATHS.includes(urlPath);
+            const isAutoMode = state.mode === 'auto';
+            let isNonAnthropic = false;
+            let dest = null;
+            let fullPath = null;
 
-            const headers = { ...clientReq.headers, host: dest.host };
-            delete headers['content-length'];
+            // For non-auto modes, resolve routing now; auto mode resolves after body parse
+            if (!isAutoMode) {
+                isNonAnthropic = NON_ANTHROPIC_BACKENDS.has(state.mode);
+                dest = isModelCall ? state.target : new URL(ANTHROPIC_FALLBACK);
 
-            if (isModelCall) {
-                delete headers['authorization'];
-                delete headers['x-api-key'];
-                if (state.useBearer) {
-                    headers['authorization'] = `Bearer ${state.apiKey}`;
+                if (isModelCall) {
+                    const base = state.target.pathname.replace(/\/$/, '');
+                    let overlap = '';
+                    for (let i = 1; i <= Math.min(base.length, urlPath.length); i++) {
+                        if (base.endsWith(urlPath.substring(0, i))) overlap = urlPath.substring(0, i);
+                    }
+                    fullPath = overlap ? base + urlPath.substring(overlap.length) : base + urlPath;
                 } else {
-                    headers['x-api-key'] = state.apiKey;
+                    fullPath = clientReq.url;
                 }
             }
+
+            // Deferred for auto mode: backendCtx set after body parse
+            let backendCtx = null;
+            let fallbackCtx = null;
+
+            // Headers (auth set after backend resolution for auto mode)
+            const headers = { ...clientReq.headers };
+            delete headers['content-length'];
 
             const chunks = [];
             clientReq.on('data', c => chunks.push(c));
             clientReq.on('end', () => {
                 let body = Buffer.concat(chunks);
 
+                // ── Auto mode: resolve backend from model tier ──
+                if (isAutoMode && isModelCall) {
+                    try {
+                        const parsed = JSON.parse(body);
+                        const route = resolveAutoBackend(parsed.model || '', allBackends);
+                        if (!route) {
+                            clientRes.writeHead(502, { 'content-type': 'application/json' });
+                            clientRes.end(JSON.stringify({ error: { message: 'Auto mode: no backend available. Set DEEPSEEK_API_KEY and/or GEMINI_API_KEY.' } }));
+                            return;
+                        }
+                        backendCtx = route.ctx;
+                        fallbackCtx = route.fallback;
+                        dest = backendCtx.target;
+                        isNonAnthropic = backendCtx.isNonAnthropic;
+                        // Build fullPath for this backend
+                        const base = dest.pathname.replace(/\/$/, '');
+                        let overlap = '';
+                        for (let i = 1; i <= Math.min(base.length, urlPath.length); i++) {
+                            if (base.endsWith(urlPath.substring(0, i))) overlap = urlPath.substring(0, i);
+                        }
+                        fullPath = overlap ? base + urlPath.substring(overlap.length) : base + urlPath;
+                        // Auth
+                        headers.host = dest.host;
+                        delete headers['authorization'];
+                        delete headers['x-api-key'];
+                        delete headers['x-goog-api-key'];
+                        if (isNonAnthropic) {
+                            headers['x-goog-api-key'] = backendCtx.apiKey;
+                        } else if (backendCtx.useBearer) {
+                            headers['authorization'] = `Bearer ${backendCtx.apiKey}`;
+                        } else {
+                            headers['x-api-key'] = backendCtx.apiKey;
+                        }
+                        console.log(`[MODEL-PROXY] #${reqId} auto → ${backendCtx.name} (${route.tier}, ${parsed.model} → ${backendCtx.model})${fallbackCtx ? ' | fallback: ' + fallbackCtx.name : ''}`);
+                    } catch (e) {
+                        console.error(`[MODEL-PROXY] #${reqId} auto resolve error: ${e.message}`);
+                        clientRes.writeHead(502, { 'content-type': 'application/json' });
+                        clientRes.end(JSON.stringify({ error: { message: 'Auto mode: failed to parse request' } }));
+                        return;
+                    }
+                }
+
+                // For non-auto model calls, set auth now
+                if (isModelCall && !isAutoMode) {
+                    headers.host = dest.host;
+                    delete headers['authorization'];
+                    delete headers['x-api-key'];
+                    delete headers['x-goog-api-key'];
+                    if (isNonAnthropic) {
+                        headers['x-goog-api-key'] = state.apiKey;
+                    } else if (state.useBearer) {
+                        headers['authorization'] = `Bearer ${state.apiKey}`;
+                    } else {
+                        headers['x-api-key'] = state.apiKey;
+                    }
+                }
+
+                const backendName = backendCtx ? backendCtx.name : state.mode;
+
                 // Remap Anthropic model names to backend-specific names
-                if (isModelCall && MODEL_REMAP[state.mode]) {
+                let remappedModel = null;
+                if (backendCtx) {
+                    try {
+                        const parsed = JSON.parse(body);
+                        console.log(`[MODEL-PROXY] #${reqId} auto model: ${parsed.model} → ${backendCtx.model}`);
+                        parsed.model = backendCtx.model;
+                        remappedModel = backendCtx.model;
+                        body = Buffer.from(JSON.stringify(parsed));
+                    } catch { /* pass */ }
+                } else if (isModelCall && MODEL_REMAP[state.mode]) {
                     try {
                         const parsed = JSON.parse(body);
                         const mapped = MODEL_REMAP[state.mode][parsed.model];
                         if (mapped) {
                             console.log(`[MODEL-PROXY] #${reqId} model remap: ${parsed.model} → ${mapped}`);
                             parsed.model = mapped;
+                            remappedModel = mapped;
                             body = Buffer.from(JSON.stringify(parsed));
                         }
                     } catch { /* not JSON or parse error, pass through */ }
                 }
 
-                // Strip thinking blocks before forwarding.
-                // Non-Anthropic: strip ALL blocks — backends reject thinking blocks
-                // they didn't generate, even unsigned ones.
-                // Anthropic after a non-Anthropic session: also strip ALL, because
-                // foreign backends generate signed-but-invalid thinking blocks that
-                // stripUnsignedThinkingBlocks passes through, causing Anthropic 400s.
-                if (isAnthropicMode && MODEL_PATHS.includes(urlPath)) {
+                // Translate request body for non-Anthropic backends (Gemini)
+                if (isModelCall && isNonAnthropic) {
                     try {
                         const parsed = JSON.parse(body);
-                        if (state.hadNonAnthropicSession) {
-                            stripAllThinkingBlocks(parsed);
-                        } else {
-                            stripUnsignedThinkingBlocks(parsed);
-                        }
-                        body = Buffer.from(JSON.stringify(parsed));
-                    } catch { /* pass through */ }
-                }
-                if (isModelCall) {
-                    try {
-                        const parsed = JSON.parse(body);
-                        stripAllThinkingBlocks(parsed);
-                        body = Buffer.from(JSON.stringify(parsed));
-                    } catch { /* pass through */ }
-                }
-
-                const opts = {
-                    hostname: dest.hostname,
-                    port: dest.port || 443,
-                    path: fullPath,
-                    method: clientReq.method,
-                    headers: { ...headers, 'content-length': body.length },
-                    timeout: REQUEST_TIMEOUT_MS,
-                };
-
-                const proxyReq = httpsRequest(opts, (proxyRes) => {
+                        const { geminiBody, geminiModel } = translateRequest(parsed);
+                        remappedModel = geminiModel;
+                        body = Buffer.from(JSON.stringify(geminiBody));
+                        const streamParam = parsed.stream !== false ? 'streamGenerateContent?alt=sse' : 'generateContent';
+                        fullPath = `/v1beta/models/${geminiModel}:${streamParam}`;
+                        console.log(`[MODEL-PROXY] #${reqId} Gemini: ${geminiModel} → ${fullPath}`);
+                    } catch(e) {
+                        console.error(`[MODEL-PROXY] #${reqId} Gemini translate error: ${e.message}`);
+                    }
+                } else {
+                    // Strip thinking blocks before forwarding
+                    if (isAnthropicMode && MODEL_PATHS.includes(urlPath)) {
+                        try {
+                            const parsed = JSON.parse(body);
+                            if (state.hadNonAnthropicSession) {
+                                stripAllThinkingBlocks(parsed);
+                            } else {
+                                stripUnsignedThinkingBlocks(parsed);
+                            }
+                            body = Buffer.from(JSON.stringify(parsed));
+                        } catch { /* pass through */ }
+                    }
                     if (isModelCall) {
-                        const ttfb = Date.now() - t0;
-                        console.log(`[MODEL-PROXY] #${reqId} TTFB ${ttfb}ms (status ${proxyRes.statusCode})`);
+                        try {
+                            const parsed = JSON.parse(body);
+                            stripAllThinkingBlocks(parsed);
+                            body = Buffer.from(JSON.stringify(parsed));
+                        } catch { /* pass through */ }
                     }
+                }
 
-                    const ct = proxyRes.headers['content-type'] || '';
-                    const isSSE = ct.includes('text/event-stream');
+                if (isModelCall && !isAutoMode) {
+                    console.log(`[MODEL-PROXY] #${reqId} → ${dest.hostname}${fullPath}`);
+                }
 
-                    if (isModelCall && isSSE) {
-                        clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
-                        const norm = new UsageNormalizer((inp, out) => recordUsage(state.mode, inp, out));
-                        proxyRes.pipe(norm).pipe(clientRes);
-                        proxyRes.on('end', () => {
-                            console.log(`[MODEL-PROXY] #${reqId} done in ${((Date.now() - t0) / 1000).toFixed(1)}s (${norm._inputTokens}in/${norm._outputTokens}out)`);
-                        });
-                    } else if (isModelCall && ct.includes('application/json')) {
-                        const respChunks = [];
-                        proxyRes.on('data', c => respChunks.push(c));
-                        proxyRes.on('end', () => {
-                            const raw = Buffer.concat(respChunks);
-                            const fixed = normalizeJsonBody(raw);
-                            try {
-                                const j = JSON.parse(fixed);
-                                if (j.usage) recordUsage(state.mode, j.usage.input_tokens, j.usage.output_tokens);
-                            } catch {}
-                            const outHeaders = { ...proxyRes.headers, 'content-length': fixed.length };
-                            clientRes.writeHead(proxyRes.statusCode, outHeaders);
-                            clientRes.end(fixed);
-                            console.log(`[MODEL-PROXY] #${reqId} done in ${((Date.now() - t0) / 1000).toFixed(1)}s (json, ${fixed.length}b)`);
-                        });
-                    } else {
-                        // Non-model or unknown content-type: pass through
-                        clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
-                        proxyRes.pipe(clientRes);
-                        if (isModelCall) {
-                            proxyRes.on('end', () => {
-                                console.log(`[MODEL-PROXY] #${reqId} done in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
-                            });
+                // ── Send upstream (with failover for auto mode) ──
+                sendUpstream(body);
+
+                function sendUpstream(bodyToSend, isRetry) {
+                    const useCtx = isRetry && fallbackCtx ? fallbackCtx : backendCtx;
+                    const useDest = useCtx ? useCtx.target : dest;
+                    const useNonAnthropic = useCtx ? useCtx.isNonAnthropic : isNonAnthropic;
+                    const useName = useCtx ? useCtx.name : backendName;
+                    let usePath = fullPath;
+                    let useBody = bodyToSend;
+
+                    if (isRetry && fallbackCtx) {
+                        // Rebuild path and body for fallback
+                        const fbBase = fallbackCtx.target.pathname.replace(/\/$/, '');
+                        let fbOverlap = '';
+                        for (let i = 1; i <= Math.min(fbBase.length, urlPath.length); i++) {
+                            if (fbBase.endsWith(urlPath.substring(0, i))) fbOverlap = urlPath.substring(0, i);
                         }
+                        usePath = fbOverlap ? fbBase + urlPath.substring(fbOverlap.length) : fbBase + urlPath;
+                        // Translate if fallback is Gemini
+                        if (fallbackCtx.isNonAnthropic) {
+                            try {
+                                const parsed = JSON.parse(bodyToSend);
+                                parsed.model = fallbackCtx.model;
+                                const { geminiBody, geminiModel } = translateRequest(parsed);
+                                const streamParam = parsed.stream !== false ? 'streamGenerateContent?alt=sse' : 'generateContent';
+                                usePath = `/v1beta/models/${geminiModel}:${streamParam}`;
+                                useBody = Buffer.from(JSON.stringify(geminiBody));
+                            } catch { /* use as-is */ }
+                        } else {
+                            try {
+                                const parsed = JSON.parse(bodyToSend);
+                                parsed.model = fallbackCtx.model;
+                                useBody = Buffer.from(JSON.stringify(parsed));
+                            } catch { /* use as-is */ }
+                        }
+                        // Rebuild headers for fallback
+                        headers.host = fallbackCtx.target.host;
+                        delete headers['authorization'];
+                        delete headers['x-api-key'];
+                        delete headers['x-goog-api-key'];
+                        if (fallbackCtx.isNonAnthropic) {
+                            headers['x-goog-api-key'] = fallbackCtx.apiKey;
+                        } else if (fallbackCtx.useBearer) {
+                            headers['authorization'] = `Bearer ${fallbackCtx.apiKey}`;
+                        } else {
+                            headers['x-api-key'] = fallbackCtx.apiKey;
+                        }
+                        console.log(`[MODEL-PROXY] #${reqId} FAILOVER → ${fallbackCtx.name} (${fallbackCtx.model})`);
                     }
-                });
 
-                proxyReq.on('timeout', () => {
-                    console.error(`[MODEL-PROXY] #${reqId} TIMEOUT after ${REQUEST_TIMEOUT_MS / 1000}s`);
-                    proxyReq.destroy(new Error('Request timeout'));
-                });
+                    const opts = {
+                        hostname: useDest.hostname,
+                        port: useDest.port || 443,
+                        path: usePath,
+                        method: clientReq.method,
+                        headers: { ...headers, 'content-length': useBody.length },
+                        timeout: REQUEST_TIMEOUT_MS,
+                    };
 
-                proxyReq.on('error', (err) => {
-                    const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
-                    console.error(`[MODEL-PROXY] #${reqId} ERROR after ${elapsed}s: ${err.message}`);
-                    if (!clientRes.headersSent) {
-                        clientRes.writeHead(502, { 'content-type': 'application/json' });
-                    }
-                    clientRes.end(JSON.stringify({ error: { message: 'Upstream connection error' } }));
-                });
+                    const proxyReq = httpsRequest(opts, (proxyRes) => {
+                        if (isModelCall) {
+                            const ttfb = Date.now() - t0;
+                            console.log(`[MODEL-PROXY] #${reqId} TTFB ${ttfb}ms (status ${proxyRes.statusCode})${isRetry ? ' [retry]' : ''}`);
+                        }
 
-                proxyReq.end(body);
+                        const ct = proxyRes.headers['content-type'] || '';
+                        const isSSE = ct.includes('text/event-stream');
+
+                        if (isModelCall && isSSE) {
+                            if (useNonAnthropic) {
+                                const translator = new GeminiStreamTranslator();
+                                const norm = new UsageNormalizer((inp, out) => recordUsage(useName, inp, out));
+                                clientRes.writeHead(proxyRes.statusCode, {
+                                    'content-type': 'text/event-stream',
+                                    'cache-control': 'no-cache',
+                                    'connection': 'keep-alive',
+                                });
+                                proxyRes.pipe(translator).pipe(norm).pipe(clientRes);
+                                proxyRes.on('end', () => {
+                                    const totalOut = translator.outputTokens || norm._outputTokens;
+                                    console.log(`[MODEL-PROXY] #${reqId} done in ${((Date.now() - t0) / 1000).toFixed(1)}s (${useName}, ${translator.inputTokens}in/${totalOut}out)${isRetry ? ' [retry]' : ''}`);
+                                });
+                            } else {
+                                clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
+                                const norm = new UsageNormalizer((inp, out) => recordUsage(useName, inp, out));
+                                proxyRes.pipe(norm).pipe(clientRes);
+                                proxyRes.on('end', () => {
+                                    console.log(`[MODEL-PROXY] #${reqId} done in ${((Date.now() - t0) / 1000).toFixed(1)}s (${norm._inputTokens}in/${norm._outputTokens}out)${isRetry ? ' [retry]' : ''}`);
+                                });
+                            }
+                        } else if (isModelCall && ct.includes('application/json')) {
+                            const respChunks = [];
+                            proxyRes.on('data', c => respChunks.push(c));
+                            proxyRes.on('end', () => {
+                                const raw = Buffer.concat(respChunks);
+                                if (useNonAnthropic) {
+                                    const translated = translateNonStreamingResponse(raw);
+                                    recordUsage(useName, translated.usage.input_tokens, translated.usage.output_tokens);
+                                    const fixed = Buffer.from(JSON.stringify(translated));
+                                    const outHeaders = { 'content-type': 'application/json', 'content-length': fixed.length };
+                                    clientRes.writeHead(proxyRes.statusCode, outHeaders);
+                                    clientRes.end(fixed);
+                                    console.log(`[MODEL-PROXY] #${reqId} done in ${((Date.now() - t0) / 1000).toFixed(1)}s (${useName}-json, ${fixed.length}b)${isRetry ? ' [retry]' : ''}`);
+                                } else {
+                                    const fixed = normalizeJsonBody(raw);
+                                    try {
+                                        const j = JSON.parse(fixed);
+                                        if (j.usage) recordUsage(useName, j.usage.input_tokens, j.usage.output_tokens);
+                                    } catch {}
+                                    const outHeaders = { ...proxyRes.headers, 'content-length': fixed.length };
+                                    clientRes.writeHead(proxyRes.statusCode, outHeaders);
+                                    clientRes.end(fixed);
+                                    console.log(`[MODEL-PROXY] #${reqId} done in ${((Date.now() - t0) / 1000).toFixed(1)}s (json, ${fixed.length}b)${isRetry ? ' [retry]' : ''}`);
+                                }
+                            });
+                        } else {
+                            clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
+                            proxyRes.pipe(clientRes);
+                            if (isModelCall) {
+                                proxyRes.on('end', () => {
+                                    console.log(`[MODEL-PROXY] #${reqId} done in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+                                });
+                            }
+                        }
+                    });
+
+                    proxyReq.on('timeout', () => {
+                        console.error(`[MODEL-PROXY] #${reqId} TIMEOUT after ${REQUEST_TIMEOUT_MS / 1000}s (${useName})`);
+                        if (!isRetry && fallbackCtx && isAutoMode) {
+                            console.log(`[MODEL-PROXY] #${reqId} failover on timeout`);
+                            sendUpstream(bodyToSend, true);
+                        } else {
+                            proxyReq.destroy(new Error('Request timeout'));
+                        }
+                    });
+
+                    proxyReq.on('error', (err) => {
+                        const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+                        console.error(`[MODEL-PROXY] #${reqId} ERROR after ${elapsed}s: ${err.message} (${useName})`);
+                        if (!isRetry && fallbackCtx && isAutoMode) {
+                            console.log(`[MODEL-PROXY] #${reqId} failover on error`);
+                            sendUpstream(bodyToSend, true);
+                        } else if (!clientRes.headersSent) {
+                            clientRes.writeHead(502, { 'content-type': 'application/json' });
+                            clientRes.end(JSON.stringify({ error: { message: 'Upstream connection error' } }));
+                        }
+                    });
+
+                    proxyReq.end(useBody);
+                }
             });
         });
 

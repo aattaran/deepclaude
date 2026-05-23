@@ -61,6 +61,7 @@ deepclaude                  # Launch Claude Code with DeepSeek V4 Pro
 deepclaude --status         # Show available backends and keys
 deepclaude --backend or     # Use OpenRouter (cheapest, $0.44/M input)
 deepclaude --backend fw     # Use Fireworks AI (fastest, US servers)
+deepclaude --backend gemini # Use Gemini 3.5 Flash (Google, 1M context)
 deepclaude --backend anthropic  # Normal Claude Code (when you need Opus)
 deepclaude --cost           # Show pricing comparison
 deepclaude --benchmark      # Latency test across all providers
@@ -88,6 +89,7 @@ Claude Code reads these environment variables to determine where to send API cal
 |---|---|---|---|---|---|
 | **DeepSeek** (default) | `--backend ds` | $0.44 | $0.87 | China | Auto context caching (120x cheaper on repeat turns) |
 | **OpenRouter** | `--backend or` | $0.44 | $0.87 | US | Cheapest, lowest latency from US/EU |
+| **Gemini 3.5 Flash** | `--backend gemini` | $1.50 | $9.00 | US | Google's latest fast model (1M context) |
 | **Fireworks AI** | `--backend fw` | $1.74 | $3.48 | US | Fastest inference |
 | **Anthropic** | `--backend anthropic` | $3.00 | $15.00 | US | Original Claude Opus (for hard problems) |
 
@@ -111,6 +113,13 @@ setx FIREWORKS_API_KEY "fw_..."          # Windows
 export FIREWORKS_API_KEY="fw_..."        # macOS/Linux
 ```
 
+**Gemini 3.5 Flash** (optional):
+```bash
+setx GEMINI_API_KEY "AIza..."            # Windows
+export GEMINI_API_KEY="AIza..."          # macOS/Linux
+```
+Get your key at [aistudio.google.com](https://aistudio.google.com). Note: Gemini uses a different API format (not Anthropic-compatible). The proxy auto-translates requests/responses, so everything works transparently.
+
 ## Cost comparison
 
 | Usage level | Anthropic Max | deepclaude (DeepSeek) | Savings |
@@ -118,8 +127,9 @@ export FIREWORKS_API_KEY="fw_..."        # macOS/Linux
 | Light (10 days/mo) | $200/mo (capped) | ~$20/mo | 90% |
 | Heavy (25 days/mo) | $200/mo (capped) | ~$50/mo | 75% |
 | With auto loops | $200/mo (capped) | ~$80/mo | 60% |
+| Gemini 3.5 Flash | $200/mo (capped) | ~$45/mo | 77% | $1.50/$9.00 per M tokens |
 
-DeepSeek's automatic context caching makes agent loops extremely cheap - after the first request, the system prompt and file context are cached at $0.004/M (vs $0.44/M uncached).
+DeepSeek's automatic context caching makes agent loops extremely cheap - after the first request, the system prompt and file context are cached at $0.004/M (vs $0.44/M uncached). Gemini 3.5 Flash offers 1M token context window with 90% off cached input ($0.15/M).
 
 ## What works and what doesn't
 
@@ -197,7 +207,14 @@ curl -sX POST http://127.0.0.1:3200/_proxy/mode -d "backend=openrouter"
 If successful, say: "Switched to OpenRouter."
 ```
 
-Then type `/deepseek`, `/anthropic`, or `/openrouter` in any Claude Code session to switch instantly.
+**`gemini.md`:**
+```
+Switch the model proxy to Gemini 3.5 Flash. Run this command silently and report the result:
+curl -sX POST http://127.0.0.1:3200/_proxy/mode -d "backend=gemini"
+If successful, say: "Switched to Gemini 3.5 Flash."
+```
+
+Then type `/deepseek`, `/anthropic`, `/openrouter`, or `/gemini` in any Claude Code session to switch instantly.
 
 ### Option 2: CLI flag
 
