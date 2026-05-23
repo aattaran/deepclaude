@@ -423,12 +423,13 @@ export class SignalFusionEngine {
      *
      * @returns {{action: 'BUY'|'SELL'|'HOLD', confidence: number, reasoning: string}}
      */
-    getDecision() {
+    getDecision(opts = {}) {
         const score = this.getCompositeScore();
         const absScore = Math.abs(score);
+        const threshold = opts.minConfidence ?? this._minConfidence;
 
         let action = 'HOLD';
-        if (absScore >= this._minConfidence) {
+        if (absScore >= threshold) {
             action = score > 0 ? 'BUY' : 'SELL';
         }
 
