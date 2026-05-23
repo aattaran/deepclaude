@@ -22,6 +22,7 @@ import { ZoneDetector } from './zone-detector.mjs';
 import { classifyRegime } from './market-regime.mjs';
 import { SignalFusionEngine } from './signal-fusion.mjs';
 import { OrderBookAnalyzer, computeMicroPrice } from './microstructure.mjs';
+import { zoneConfluenceScore } from './confluence.mjs';
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -248,7 +249,20 @@ export function createOrchestrator(config = {}) {
         const zoneSignals = signalsFromZones(activeZones, currentPrice);
         const regimeSignals = signalsFromRegime(regime);
         const obSignals = signalsFromOrderBook(obResult);
-        const allSignals = [...zoneSignals, ...regimeSignals, ...obSignals];
+
+        // Confluence: how clustered are the active zones? Higher = stronger signal quality
+        const confluenceScore = zoneConfluenceScore(activeZones, currentPrice);
+        const confluenceSignals = [];
+        if (confluenceScore > 0) {
+            confluenceSignals.push({
+                source: 'confluence',
+                name: 'zone_clustering',
+                value: confluenceScore,
+                confidence: Math.min(confluenceScore * 1.2, 1.0),
+            });
+        }
+
+        const allSignals = [...zoneSignals, ...regimeSignals, ...obSignals, ...confluenceSignals];
 
         // ── 5. Signal Fusion ──
         const fusion = new SignalFusionEngine({ method: fusionMethod });
