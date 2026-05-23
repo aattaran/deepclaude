@@ -1,0 +1,37 @@
+# Sample trade data — 35 trades across 30 days for realistic Sharpe/MaxDD
+# Format: one JSON object per line — TradeRecord schema
+{"symbol":"MNQ","direction":"long","entry_price":19512.00,"exit_price":19532.50,"pnl_usd":41.00,"hold_sec":180,"entry_time":1716150000000,"exit_time":1716150180000,"exit_reason":"TARGET"}
+{"symbol":"MNQ","direction":"short","entry_price":19545.00,"exit_price":19520.00,"pnl_usd":50.00,"hold_sec":240,"entry_time":1716236400000,"exit_time":1716236640000,"exit_reason":"TARGET"}
+{"symbol":"MNQ","direction":"long","entry_price":19518.00,"exit_price":19508.00,"pnl_usd":-20.00,"hold_sec":90,"entry_time":1716322800000,"exit_time":1716322890000,"exit_reason":"STOP"}
+{"symbol":"MNQ","direction":"short","entry_price":19555.00,"exit_price":19525.00,"pnl_usd":60.00,"hold_sec":300,"entry_time":1716409200000,"exit_time":1716409500000,"exit_reason":"SIGNAL"}
+{"symbol":"MNQ","direction":"long","entry_price":19522.00,"exit_price":19542.00,"pnl_usd":40.00,"hold_sec":150,"entry_time":1716495600000,"exit_time":1716495750000,"exit_reason":"TARGET"}
+{"symbol":"MNQ","direction":"short","entry_price":19560.00,"exit_price":19575.00,"pnl_usd":-30.00,"hold_sec":120,"entry_time":1716582000000,"exit_time":1716582120000,"exit_reason":"STOP"}
+{"symbol":"MNQ","direction":"long","entry_price":19530.00,"exit_price":19550.00,"pnl_usd":40.00,"hold_sec":210,"entry_time":1716668400000,"exit_time":1716668610000,"exit_reason":"BROKER-FLATTEN"}
+{"symbol":"MNQ","direction":"short","entry_price":19570.00,"exit_price":19545.00,"pnl_usd":50.00,"hold_sec":270,"entry_time":1716754800000,"exit_time":1716755070000,"exit_reason":"TARGET"}
+{"symbol":"MNQ","direction":"long","entry_price":19540.00,"exit_price":19535.00,"pnl_usd":-10.00,"hold_sec":60,"entry_time":1716841200000,"exit_time":1716841260000,"exit_reason":"STOP"}
+{"symbol":"MNQ","direction":"short","entry_price":19580.00,"exit_price":19550.00,"pnl_usd":60.00,"hold_sec":360,"entry_time":1716927600000,"exit_time":1716927960000,"exit_reason":"SIGNAL"}
+{"symbol":"MNQ","direction":"long","entry_price":19545.00,"exit_price":19565.00,"pnl_usd":40.00,"hold_sec":195,"entry_time":1717014000000,"exit_time":1717014195000,"exit_reason":"TARGET"}
+{"symbol":"MNQ","direction":"short","entry_price":19590.00,"exit_price":19605.00,"pnl_usd":-30.00,"hold_sec":105,"entry_time":1717100400000,"exit_time":1717100505000,"exit_reason":"STOP"}
+{"symbol":"MNQ","direction":"long","entry_price":19535.00,"exit_price":19515.00,"pnl_usd":-40.00,"hold_sec":180,"entry_time":1717186800000,"exit_time":1717186980000,"exit_reason":"STOP"}
+{"symbol":"MNQ","direction":"short","entry_price":19550.00,"exit_price":19520.00,"pnl_usd":60.00,"hold_sec":330,"entry_time":1717273200000,"exit_time":1717273530000,"exit_reason":"TARGET"}
+{"symbol":"MNQ","direction":"long","entry_price":19500.00,"exit_price":19525.00,"pnl_usd":50.00,"hold_sec":240,"entry_time":1717359600000,"exit_time":1717359840000,"exit_reason":"BROKER-FLATTEN"}
+{"symbol":"MNQ","direction":"short","entry_price":19565.00,"exit_price":19585.00,"pnl_usd":-40.00,"hold_sec":90,"entry_time":1717446000000,"exit_time":1717446090000,"exit_reason":"STOP"}
+{"symbol":"MNQ","direction":"long","entry_price":19520.00,"exit_price":19540.00,"pnl_usd":40.00,"hold_sec":165,"entry_time":1717532400000,"exit_time":1717532565000,"exit_reason":"TARGET"}
+{"symbol":"MNQ","direction":"short","entry_price":19575.00,"exit_price":19550.00,"pnl_usd":50.00,"hold_sec":285,"entry_time":1717618800000,"exit_time":1717619085000,"exit_reason":"TARGET"}
+{"symbol":"MNQ","direction":"long","entry_price":19542.00,"exit_price":19562.00,"pnl_usd":40.00,"hold_sec":210,"entry_time":1717705200000,"exit_time":1717705410000,"exit_reason":"SIGNAL"}
+{"symbol":"MNQ","direction":"short","entry_price":19595.00,"exit_price":19610.00,"pnl_usd":-30.00,"hold_sec":75,"entry_time":1717791600000,"exit_time":1717791675000,"exit_reason":"STOP"}
+{"symbol":"MNQ","direction":"long","entry_price":19508.00,"exit_price":19488.00,"pnl_usd":-40.00,"hold_sec":135,"entry_time":1717878000000,"exit_time":1717878135000,"exit_reason":"STOP"}
+{"symbol":"MNQ","direction":"short","entry_price":19548.00,"exit_price":19518.00,"pnl_usd":60.00,"hold_sec":315,"entry_time":1717964400000,"exit_time":1717964715000,"exit_reason":"TARGET"}
+{"symbol":"MNQ","direction":"long","entry_price":19515.00,"exit_price":19535.00,"pnl_usd":40.00,"hold_sec":195,"entry_time":1718050800000,"exit_time":1718050995000,"exit_reason":"BROKER-FLATTEN"}
+{"symbol":"MNQ","direction":"short","entry_price":19560.00,"exit_price":19535.00,"pnl_usd":50.00,"hold_sec":255,"entry_time":1718137200000,"exit_time":1718137455000,"exit_reason":"TARGET"}
+{"symbol":"MNQ","direction":"long","entry_price":19528.00,"exit_price":19548.00,"pnl_usd":40.00,"hold_sec":180,"entry_time":1718223600000,"exit_time":1718223780000,"exit_reason":"TARGET"}
+{"symbol":"MNQ","direction":"short","entry_price":19588.00,"exit_price":19568.00,"pnl_usd":40.00,"hold_sec":300,"entry_time":1718310000000,"exit_time":1718310300000,"exit_reason":"SIGNAL"}
+{"symbol":"MNQ","direction":"long","entry_price":19555.00,"exit_price":19535.00,"pnl_usd":-40.00,"hold_sec":120,"entry_time":1718396400000,"exit_time":1718396520000,"exit_reason":"STOP"}
+{"symbol":"MNQ","direction":"short","entry_price":19542.00,"exit_price":19562.00,"pnl_usd":-40.00,"hold_sec":90,"entry_time":1718482800000,"exit_time":1718482890000,"exit_reason":"STOP"}
+{"symbol":"MNQ","direction":"long","entry_price":19505.00,"exit_price":19535.00,"pnl_usd":60.00,"hold_sec":360,"entry_time":1718569200000,"exit_time":1718569560000,"exit_reason":"TARGET"}
+{"symbol":"MNQ","direction":"short","entry_price":19572.00,"exit_price":19542.00,"pnl_usd":60.00,"hold_sec":270,"entry_time":1718655600000,"exit_time":1718655870000,"exit_reason":"TARGET"}
+{"symbol":"MNQ","direction":"long","entry_price":19538.00,"exit_price":19518.00,"pnl_usd":-40.00,"hold_sec":105,"entry_time":1718742000000,"exit_time":1718742105000,"exit_reason":"STOP"}
+{"symbol":"MNQ","direction":"short","entry_price":19550.00,"exit_price":19525.00,"pnl_usd":50.00,"hold_sec":225,"entry_time":1718828400000,"exit_time":1718828625000,"exit_reason":"BROKER-FLATTEN"}
+{"symbol":"MNQ","direction":"long","entry_price":19520.00,"exit_price":19545.00,"pnl_usd":50.00,"hold_sec":270,"entry_time":1718914800000,"exit_time":1718915070000,"exit_reason":"TARGET"}
+{"symbol":"MNQ","direction":"short","entry_price":19585.00,"exit_price":19565.00,"pnl_usd":40.00,"hold_sec":195,"entry_time":1719001200000,"exit_time":1719001395000,"exit_reason":"SIGNAL"}
+{"symbol":"MNQ","direction":"long","entry_price":19548.00,"exit_price":19528.00,"pnl_usd":-40.00,"hold_sec":150,"entry_time":1719087600000,"exit_time":1719087750000,"exit_reason":"STOP"}

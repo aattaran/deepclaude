@@ -1,0 +1,14 @@
+{
+  "name": "deepclaude",
+  "version": "1.5.0",
+  "private": true,
+  "description": "Claude Code with any LLM backend — DeepSeek, Gemini 3.5 Flash, OpenRouter, Fireworks AI",
+  "type": "module",
+  "scripts": {
+    "start": "node proxy/start-proxy.js",
+    "test": "node --test proxy/*.test.js alpha-parser/*.test.js audit/*.test.js",
+    "test:proxy": "node --test proxy/*.test.js"
+  },
+  "keywords": ["claude-code", "llm-proxy", "deepseek", "gemini", "anthropic"],
+  "license": "MIT"
+}

@@ -190,7 +190,9 @@ function mapRole(anthropicRole) {
     switch (anthropicRole) {
         case 'user': return 'user';
         case 'assistant': return 'model';
-        default: return null;
+        default:
+            console.warn(`[gemini-translator] Unknown role "${anthropicRole}" — message dropped`);
+            return null;
     }
 }
 
@@ -422,8 +424,8 @@ export class GeminiStreamTranslator extends Transform {
 function mapFinishReason(reason) {
     switch (reason) {
         case 'MAX_TOKENS': return 'max_tokens';
-        case 'SAFETY':
-        case 'RECITATION': return 'end_turn';  // closest match
+        case 'SAFETY': return 'safety_blocked';
+        case 'RECITATION': return 'recitation_blocked';
         case 'STOP':
         case null:
         case undefined: return 'end_turn';
