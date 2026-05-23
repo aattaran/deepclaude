@@ -3,6 +3,8 @@ import { request as httpsRequest } from 'https';
 import { URL } from 'url';
 import { Transform } from 'stream';
 import { translateRequest, GeminiStreamTranslator, translateNonStreamingResponse } from './gemini-translator.js';
+import { createLogger, createMetrics, correlationId, getHealthReport } from './observability.js';
+import { CircuitBreaker, withRetry, BackendHealthTracker, selectFallback } from './circuit-breaker.js';
 
 const ANTHROPIC_FALLBACK = 'https://api.anthropic.com';
 const GEMINI_BASE = 'https://generativelanguage.googleapis.com';
@@ -86,6 +88,27 @@ const PRICING_PER_M = {
     anthropic:  { input: 3.00,  output: 15.00 },
     _single:    { input: 0.44,  output: 0.87 },
 };
+
+const log = createLogger(process.env.LOG_LEVEL || 'info');
+const metrics = createMetrics();
+
+// Circuit breaker instances per backend (lazy-created on first use)
+const circuitBreakers = {};
+function getCircuitBreaker(name) {
+    if (!circuitBreakers[name]) {
+        circuitBreakers[name] = new CircuitBreaker({ failureThreshold: 5, resetTimeout: 30000 });
+    }
+    return circuitBreakers[name];
+}
+
+// Backend health tracker instances per backend (lazy-created on first use)
+const healthTrackers = {};
+function getHealthTracker(name) {
+    if (!healthTrackers[name]) {
+        healthTrackers[name] = new BackendHealthTracker();
+    }
+    return healthTrackers[name];
+}
 
 /**
  * Transform stream that intercepts SSE events and injects missing `usage`
@@ -479,6 +502,25 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                     clientRes.end(JSON.stringify(getCostSummary()));
                     return;
                 }
+                if (urlPath === '/_proxy/health') {
+                    const backendsHealth = [];
+                    for (const [name, cfg] of Object.entries(allBackends)) {
+                        backendsHealth.push({
+                            name,
+                            status: cfg.apiKey ? 'ok' : 'degraded',
+                        });
+                    }
+                    const uptime = Math.round((Date.now() - t0Global) / 1000);
+                    const report = getHealthReport(metrics.getSnapshot(), uptime, backendsHealth);
+                    clientRes.writeHead(200, { 'content-type': 'application/json' });
+                    clientRes.end(JSON.stringify(report));
+                    return;
+                }
+                if (urlPath === '/_proxy/metrics') {
+                    clientRes.writeHead(200, { 'content-type': 'text/plain; version=0.0.4' });
+                    clientRes.end(metrics.getPrometheus());
+                    return;
+                }
                 if (urlPath === '/_proxy/mode' && clientReq.method === 'POST') {
                     const origin = clientReq.headers['origin'] || '';
                     if (origin && !origin.startsWith('http://127.0.0.1') && !origin.startsWith('http://localhost')) {
@@ -507,7 +549,7 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                             clientRes.end(JSON.stringify(result));
                             return;
                         }
-                        console.log(`[MODEL-PROXY] Mode switched: ${result.previous} → ${result.mode}`);
+                        log.info(`Mode switched: ${result.previous} → ${result.mode}`, { correlationId: cid, reqId });
                         clientRes.writeHead(200, { 'content-type': 'application/json' });
                         clientRes.end(JSON.stringify(result));
                     });
@@ -525,6 +567,7 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
 
             const reqId = ++reqCount;
             const t0 = Date.now();
+            const cid = correlationId();
 
             // --- Routing context (overridden for auto mode after body parse) ---
             const isAnthropicMode = state.mode === 'anthropic';
@@ -570,6 +613,8 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                         const parsed = JSON.parse(body);
                         const route = resolveAutoBackend(parsed.model || '', allBackends);
                         if (!route) {
+                            log.warn('auto mode: no backend available', { correlationId: cid, reqId });
+                            metrics.recordRequest(state.mode, parsed.model || 'unknown', Date.now() - t0, 502, 'no_backend');
                             clientRes.writeHead(502, { 'content-type': 'application/json' });
                             clientRes.end(JSON.stringify({ error: { message: 'Auto mode: no backend available. Set DEEPSEEK_API_KEY and/or GEMINI_API_KEY.' } }));
                             return;
@@ -597,9 +642,10 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                         } else {
                             headers['x-api-key'] = backendCtx.apiKey;
                         }
-                        console.log(`[MODEL-PROXY] #${reqId} auto → ${backendCtx.name} (${route.tier}, ${parsed.model} → ${backendCtx.model})${fallbackCtx ? ' | fallback: ' + fallbackCtx.name : ''}`);
+                        log.info(`auto → ${backendCtx.name} (${route.tier}, ${parsed.model} → ${backendCtx.model})${fallbackCtx ? ' | fallback: ' + fallbackCtx.name : ''}`, { correlationId: cid, reqId });
                     } catch (e) {
-                        console.error(`[MODEL-PROXY] #${reqId} auto resolve error: ${e.message}`);
+                        log.error(`auto resolve error: ${e.message}`, { correlationId: cid, reqId });
+                        metrics.recordRequest(state.mode, 'unknown', Date.now() - t0, 502, 'parse_error');
                         clientRes.writeHead(502, { 'content-type': 'application/json' });
                         clientRes.end(JSON.stringify({ error: { message: 'Auto mode: failed to parse request' } }));
                         return;
@@ -624,11 +670,11 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                 const backendName = backendCtx ? backendCtx.name : state.mode;
 
                 // Remap Anthropic model names to backend-specific names
-                let remappedModel = null;
+                let remappedModel = 'unknown';
                 if (backendCtx) {
                     try {
                         const parsed = JSON.parse(body);
-                        console.log(`[MODEL-PROXY] #${reqId} auto model: ${parsed.model} → ${backendCtx.model}`);
+                        log.info(`auto model: ${parsed.model} → ${backendCtx.model}`, { correlationId: cid, reqId });
                         parsed.model = backendCtx.model;
                         remappedModel = backendCtx.model;
                         body = Buffer.from(JSON.stringify(parsed));
@@ -638,7 +684,7 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                         const parsed = JSON.parse(body);
                         const mapped = MODEL_REMAP[state.mode][parsed.model];
                         if (mapped) {
-                            console.log(`[MODEL-PROXY] #${reqId} model remap: ${parsed.model} → ${mapped}`);
+                            log.info(`model remap: ${parsed.model} → ${mapped}`, { correlationId: cid, reqId });
                             parsed.model = mapped;
                             remappedModel = mapped;
                             body = Buffer.from(JSON.stringify(parsed));
@@ -655,9 +701,9 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                         body = Buffer.from(JSON.stringify(geminiBody));
                         const streamParam = parsed.stream !== false ? 'streamGenerateContent?alt=sse' : 'generateContent';
                         fullPath = `/v1beta/models/${geminiModel}:${streamParam}`;
-                        console.log(`[MODEL-PROXY] #${reqId} Gemini: ${geminiModel} → ${fullPath}`);
+                        log.info(`Gemini: ${geminiModel} → ${fullPath}`, { correlationId: cid, reqId });
                     } catch(e) {
-                        console.error(`[MODEL-PROXY] #${reqId} Gemini translate error: ${e.message}`);
+                        log.error(`Gemini translate error: ${e.message}`, { correlationId: cid, reqId });
                     }
                 } else {
                     // Apply Anthropic API compatibility fixes (May 2026 breaking changes)
@@ -700,7 +746,7 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                 }
 
                 if (isModelCall && !isAutoMode) {
-                    console.log(`[MODEL-PROXY] #${reqId} → ${dest.hostname}${fullPath}`);
+                    log.info(`${dest.hostname}${fullPath}`, { correlationId: cid, reqId });
                 }
 
                 // ── Send upstream (with failover for auto mode) ──
@@ -751,7 +797,7 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                         } else {
                             headers['x-api-key'] = fallbackCtx.apiKey;
                         }
-                        console.log(`[MODEL-PROXY] #${reqId} FAILOVER → ${fallbackCtx.name} (${fallbackCtx.model})`);
+                        log.warn(`FAILOVER → ${fallbackCtx.name} (${fallbackCtx.model})`, { correlationId: cid, reqId });
                     }
 
                     // DeepSeek: map Anthropic effort to reasoning_effort before sending
@@ -772,10 +818,56 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                         timeout: REQUEST_TIMEOUT_MS,
                     };
 
-                    const proxyReq = httpsRequest(opts, (proxyRes) => {
+                    // ── Circuit breaker: fast-fail if OPEN ──
+                    const cb = getCircuitBreaker(useName);
+                    const ht = getHealthTracker(useName);
+                    const cState = cb.getState();
+
+                    if (cState.state === 'OPEN') {
+                        log.warn(`Circuit breaker: ${useName} is OPEN`, { correlationId: cid, reqId });
+                        if (!isRetry && fallbackCtx) {
+                            log.warn(`Circuit breaker: failover from ${useName} to ${fallbackCtx.name}`, { correlationId: cid, reqId });
+                            sendUpstream(bodyToSend, true);
+                            return;
+                        }
+                        if (!clientRes.headersSent) {
+                            clientRes.writeHead(503, { 'content-type': 'application/json' });
+                            clientRes.end(JSON.stringify({ error: { message: `Backend "${useName}" is unavailable (circuit breaker open)` } }));
+                        }
+                        metrics.recordRequest(useName, remappedModel, Date.now() - t0, 503, 'circuit_open');
+                        return;
+                    }
+
+                    if (cState.state === 'HALF_OPEN') {
+                        log.warn(`Circuit breaker: ${useName} is HALF_OPEN`, { correlationId: cid, reqId });
+                    }
+
+                    const tReqStart = Date.now();
+
+                    // ── Upstream request with retry ──
+                    withRetry(() => new Promise((resolve, reject) => {
+                        const proxyReq = httpsRequest(opts, (proxyRes) => resolve(proxyRes));
+                        proxyReq.setTimeout(REQUEST_TIMEOUT_MS, () => {
+                            proxyReq.destroy();
+                            const err = new Error('Upstream timeout');
+                            err.statusCode = 408;
+                            reject(err);
+                        });
+                        proxyReq.on('error', reject);
+                        proxyReq.end(useBody);
+                    }), { maxRetries: 3, baseDelay: 1000 })
+                    .then(({ result: proxyRes, attempts }) => {
+                        // Record success on circuit breaker and health tracker
+                        cb._onSuccess();
+                        ht.recordSuccess(useName);
+                        const afterState = cb.getState();
+                        if (afterState.state !== cState.state) {
+                            log.warn(`Circuit breaker: ${useName} ${cState.state} → ${afterState.state}`, { correlationId: cid, reqId });
+                        }
+
                         if (isModelCall) {
                             const ttfb = Date.now() - t0;
-                            console.log(`[MODEL-PROXY] #${reqId} TTFB ${ttfb}ms (status ${proxyRes.statusCode})${isRetry ? ' [retry]' : ''}`);
+                            log.info(`TTFB ${ttfb}ms (status ${proxyRes.statusCode})${isRetry ? ' [retry]' : ''}`, { correlationId: cid, reqId });
                         }
 
                         const ct = proxyRes.headers['content-type'] || '';
@@ -793,14 +885,18 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                                 proxyRes.pipe(translator).pipe(norm).pipe(clientRes);
                                 proxyRes.on('end', () => {
                                     const totalOut = translator.outputTokens || norm._outputTokens;
-                                    console.log(`[MODEL-PROXY] #${reqId} done in ${((Date.now() - t0) / 1000).toFixed(1)}s (${useName}, ${translator.inputTokens}in/${totalOut}out)${isRetry ? ' [retry]' : ''}`);
+                                    const latencyMs = Date.now() - t0;
+                                    log.info(`done in ${(latencyMs / 1000).toFixed(1)}s (${useName}, ${translator.inputTokens}in/${totalOut}out)${isRetry ? ' [retry]' : ''}`, { correlationId: cid, reqId });
+                                    metrics.recordRequest(useName, remappedModel, latencyMs, proxyRes.statusCode);
                                 });
                             } else {
                                 clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
                                 const norm = new UsageNormalizer((inp, out) => recordUsage(useName, inp, out));
                                 proxyRes.pipe(norm).pipe(clientRes);
                                 proxyRes.on('end', () => {
-                                    console.log(`[MODEL-PROXY] #${reqId} done in ${((Date.now() - t0) / 1000).toFixed(1)}s (${norm._inputTokens}in/${norm._outputTokens}out)${isRetry ? ' [retry]' : ''}`);
+                                    const latencyMs = Date.now() - t0;
+                                    log.info(`done in ${(latencyMs / 1000).toFixed(1)}s (${norm._inputTokens}in/${norm._outputTokens}out)${isRetry ? ' [retry]' : ''}`, { correlationId: cid, reqId });
+                                    metrics.recordRequest(useName, remappedModel, latencyMs, proxyRes.statusCode);
                                 });
                             }
                         } else if (isModelCall && ct.includes('application/json')) {
@@ -815,7 +911,9 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                                     const outHeaders = { 'content-type': 'application/json', 'content-length': fixed.length };
                                     clientRes.writeHead(proxyRes.statusCode, outHeaders);
                                     clientRes.end(fixed);
-                                    console.log(`[MODEL-PROXY] #${reqId} done in ${((Date.now() - t0) / 1000).toFixed(1)}s (${useName}-json, ${fixed.length}b)${isRetry ? ' [retry]' : ''}`);
+                                    const latencyMs = Date.now() - t0;
+                                    log.info(`done in ${(latencyMs / 1000).toFixed(1)}s (${useName}-json, ${fixed.length}b)${isRetry ? ' [retry]' : ''}`, { correlationId: cid, reqId });
+                                    metrics.recordRequest(useName, remappedModel, latencyMs, proxyRes.statusCode);
                                 } else {
                                     const fixed = normalizeJsonBody(raw);
                                     try {
@@ -825,43 +923,45 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                                     const outHeaders = { ...proxyRes.headers, 'content-length': fixed.length };
                                     clientRes.writeHead(proxyRes.statusCode, outHeaders);
                                     clientRes.end(fixed);
-                                    console.log(`[MODEL-PROXY] #${reqId} done in ${((Date.now() - t0) / 1000).toFixed(1)}s (json, ${fixed.length}b)${isRetry ? ' [retry]' : ''}`);
+                                    const latencyMs = Date.now() - t0;
+                                    log.info(`done in ${(latencyMs / 1000).toFixed(1)}s (json, ${fixed.length}b)${isRetry ? ' [retry]' : ''}`, { correlationId: cid, reqId });
+                                    metrics.recordRequest(useName, remappedModel, latencyMs, proxyRes.statusCode);
                                 }
                             });
                         } else {
                             clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
                             proxyRes.pipe(clientRes);
-                            if (isModelCall) {
-                                proxyRes.on('end', () => {
-                                    console.log(`[MODEL-PROXY] #${reqId} done in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
-                                });
-                            }
+                            proxyRes.on('end', () => {
+                                const latencyMs = Date.now() - t0;
+                                if (isModelCall) {
+                                    log.info(`done in ${(latencyMs / 1000).toFixed(1)}s`, { correlationId: cid, reqId });
+                                }
+                                metrics.recordRequest(useName, remappedModel, latencyMs, proxyRes.statusCode);
+                            });
                         }
-                    });
+                    })
+                    .catch((err) => {
+                        // Record failure on circuit breaker and health tracker
+                        cb._onFailure(err);
+                        ht.recordFailure(useName, err);
+                        const afterState = cb.getState();
+                        if (afterState.state !== cState.state) {
+                            log.warn(`Circuit breaker: ${useName} ${cState.state} → ${afterState.state}`, { correlationId: cid, reqId });
+                        }
 
-                    proxyReq.on('timeout', () => {
-                        console.error(`[MODEL-PROXY] #${reqId} TIMEOUT after ${REQUEST_TIMEOUT_MS / 1000}s (${useName})`);
+                        const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+                        log.error(`ERROR after ${elapsed}s: ${err.message} (${useName})`, { correlationId: cid, reqId });
                         if (!isRetry && fallbackCtx && isAutoMode) {
-                            console.log(`[MODEL-PROXY] #${reqId} failover on timeout`);
+                            log.warn(`failover on error`, { correlationId: cid, reqId });
                             sendUpstream(bodyToSend, true);
                         } else {
-                            proxyReq.destroy(new Error('Request timeout'));
+                            if (!clientRes.headersSent) {
+                                clientRes.writeHead(502, { 'content-type': 'application/json' });
+                                clientRes.end(JSON.stringify({ error: { message: 'Upstream connection error' } }));
+                            }
+                            metrics.recordRequest(useName, remappedModel, Date.now() - t0, 502, 'connection');
                         }
                     });
-
-                    proxyReq.on('error', (err) => {
-                        const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
-                        console.error(`[MODEL-PROXY] #${reqId} ERROR after ${elapsed}s: ${err.message} (${useName})`);
-                        if (!isRetry && fallbackCtx && isAutoMode) {
-                            console.log(`[MODEL-PROXY] #${reqId} failover on error`);
-                            sendUpstream(bodyToSend, true);
-                        } else if (!clientRes.headersSent) {
-                            clientRes.writeHead(502, { 'content-type': 'application/json' });
-                            clientRes.end(JSON.stringify({ error: { message: 'Upstream connection error' } }));
-                        }
-                    });
-
-                    proxyReq.end(useBody);
                 }
             });
         });
@@ -876,7 +976,7 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
             });
             server.listen(port, '127.0.0.1', () => {
                 const actualPort = server.address().port;
-                console.log(`[MODEL-PROXY] Listening on 127.0.0.1:${actualPort} → ${targetUrl} (mode: ${state.mode})`);
+                log.info(`Listening on 127.0.0.1:${actualPort} → ${targetUrl} (mode: ${state.mode})`);
                 resolve({ port: actualPort, close: () => server.close(), switchMode });
             });
         }
