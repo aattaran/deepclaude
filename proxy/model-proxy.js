@@ -9,6 +9,7 @@ const GEMINI_BASE = 'https://generativelanguage.googleapis.com';
 const MODEL_PATHS = ['/v1/messages'];
 const REQUEST_TIMEOUT_MS = 5 * 60 * 1000; // 5 min per request
 const NON_ANTHROPIC_BACKENDS = new Set(['gemini']);
+const ANTHROPIC_THINKING_BACKENDS = new Set(['deepseek', 'anthropic']);
 const HAIKU_PATTERN = /^claude-haiku/;
 
 // Auto-routing: Haiku-tier → Gemini, Opus/Sonnet → DeepSeek
@@ -173,6 +174,82 @@ function stripUnsignedThinkingBlocks(body) {
         msg.content = msg.content.filter(
             block => block.type !== 'thinking' || block.signature
         );
+    }
+}
+
+/**
+ * Remove fields that DeepSeek's Anthropic-compatible endpoint does not support:
+ *   - image content blocks
+ *   - document content blocks
+ *   - cache_control on any content block
+ *   - top_k (top-level parameter)
+ *   - disable_parallel_tool_use (top-level parameter)
+ * Logs a warning for each stripped field type so users are aware.
+ */
+function stripDeepSeekUnsupportedFields(body) {
+    if (!body) return;
+
+    const dropped = [];
+
+    if ('top_k' in body) {
+        dropped.push('top_k');
+        delete body.top_k;
+    }
+    if ('disable_parallel_tool_use' in body) {
+        dropped.push('disable_parallel_tool_use');
+        delete body.disable_parallel_tool_use;
+    }
+
+    if (!Array.isArray(body.messages)) {
+        if (dropped.length) {
+            console.warn(`[MODEL-PROXY] DeepSeek unsupported fields stripped: ${dropped.join(', ')}`);
+        }
+        return;
+    }
+
+    let droppedBlocks = false;
+    let droppedCacheControl = false;
+
+    for (const msg of body.messages) {
+        if (!Array.isArray(msg.content)) continue;
+
+        // Filter unsupported block types
+        const filtered = msg.content.filter(block => {
+            if (block.type === 'image' || block.type === 'document') {
+                droppedBlocks = true;
+                return false;
+            }
+            return true;
+        });
+
+        // Strip cache_control from remaining blocks
+        for (const block of filtered) {
+            if (block.cache_control) {
+                droppedCacheControl = true;
+                delete block.cache_control;
+            }
+        }
+
+        msg.content = filtered;
+    }
+
+    if (dropped.length || droppedBlocks || droppedCacheControl) {
+        const parts = [];
+        if (dropped.length) parts.push(dropped.join(', '));
+        if (droppedBlocks) parts.push('image/document blocks');
+        if (droppedCacheControl) parts.push('cache_control');
+        console.warn(`[MODEL-PROXY] DeepSeek unsupported fields stripped: ${parts.join(', ')}`);
+    }
+}
+
+
+/** Map Anthropic effort to DeepSeek reasoning_effort. */
+function mapEffortToReasoning(body) {
+    if (!body?.effort) return;
+    const valid = ['low', 'medium', 'high', 'max'];
+    if (valid.includes(body.effort)) {
+        body.reasoning_effort = body.effort === 'max' ? 'high' : body.effort;
+        delete body.effort;
     }
 }
 
@@ -604,10 +681,19 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                             body = Buffer.from(JSON.stringify(parsed));
                         } catch { /* pass through */ }
                     }
-                    if (isModelCall) {
+                    if (isModelCall && !ANTHROPIC_THINKING_BACKENDS.has(backendName)) {
                         try {
                             const parsed = JSON.parse(body);
                             stripAllThinkingBlocks(parsed);
+                            body = Buffer.from(JSON.stringify(parsed));
+                        } catch { /* pass through */ }
+                    }
+
+                    // Strip unsupported fields for DeepSeek
+                    if (isModelCall && backendName === 'deepseek') {
+                        try {
+                            const parsed = JSON.parse(body);
+                            stripDeepSeekUnsupportedFields(parsed);
                             body = Buffer.from(JSON.stringify(parsed));
                         } catch { /* pass through */ }
                     }
@@ -666,6 +752,15 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                             headers['x-api-key'] = fallbackCtx.apiKey;
                         }
                         console.log(`[MODEL-PROXY] #${reqId} FAILOVER → ${fallbackCtx.name} (${fallbackCtx.model})`);
+                    }
+
+                    // DeepSeek: map Anthropic effort to reasoning_effort before sending
+                    if (useName === 'deepseek') {
+                        try {
+                            const parsed = JSON.parse(useBody);
+                            mapEffortToReasoning(parsed);
+                            useBody = Buffer.from(JSON.stringify(parsed));
+                        } catch { /* pass through */ }
                     }
 
                     const opts = {
@@ -794,11 +889,14 @@ export {
     MODEL_REMAP,
     PRICING_PER_M,
     NON_ANTHROPIC_BACKENDS,
+    ANTHROPIC_THINKING_BACKENDS,
     AUTO_ROUTE,
     isHaikuModel,
     resolveAutoBackend,
     stripAllThinkingBlocks,
     stripUnsignedThinkingBlocks,
+    stripDeepSeekUnsupportedFields,
+    mapEffortToReasoning,
     normalizeThinkingBlocks,
     stripSamplingParamsOnThinking,
     normalizeOutputConfig,

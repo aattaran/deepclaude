@@ -2,6 +2,9 @@
 import { startModelProxy } from './model-proxy.js';
 
 const BACKEND_DEFS = {
+    // DeepSeek Anthropic-compatible endpoint — accepts Anthropic SDK format natively.
+    // Supports: thinking, reasoning_effort, tool_use, tool_result blocks.
+    // Does NOT support: image, document, cache_control, top_k, disable_parallel_tool_use.
     deepseek: { url: 'https://api.deepseek.com/anthropic', keyEnv: 'DEEPSEEK_API_KEY' },
     openrouter: { url: 'https://openrouter.ai/api/v1', keyEnv: 'OPENROUTER_API_KEY' },
     fireworks: { url: 'https://api.fireworks.ai/inference/v1', keyEnv: 'FIREWORKS_API_KEY' },

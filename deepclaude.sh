@@ -128,18 +128,23 @@ show_status() {
 
 show_cost() {
     echo ""
-    echo "  DeepSeek V4 Pro Pricing"
-    echo "  ======================="
+    echo "  Model Pricing (per 1M tokens, May 2026)"
+    echo "  ========================================="
     echo ""
-    echo "  Provider        Input/M    Output/M   Cache Hit/M"
-    echo "  ----------      --------   --------   -----------"
-    echo "  DeepSeek        \$0.44      \$0.87      \$0.004"
-    echo "  OpenRouter      \$0.44      \$0.87      (provider)"
-    echo "  Fireworks       \$1.74      \$3.48      (provider)"
+    echo "  Provider        Input/M    Output/M   Cache/M"
+    echo "  ----------      --------   --------   ------"
+    echo "  DeepSeek V4     \$0.44*     \$0.87*     \$0.004"
+    echo "  OpenRouter      \$0.44      \$0.87      -"
+    echo "  Fireworks       \$1.74      \$3.48      -"
     echo "  Gemini 3.5      \$1.50      \$9.00      \$0.15"
     echo "  Anthropic       \$3.00      \$15.00     \$0.30"
     echo ""
-    echo "  Monthly estimate (heavy use, 25 days): \$30-80"
+    echo "  * DeepSeek 75% discount until May 31, post-discount:"
+    echo "    Pro: \$1.74/\$3.48/M | Flash: \$0.14/\$0.28/M"
+    echo ""
+    echo "  Auto-mode routes cheapest model per tier:"
+    echo "    Haiku → Gemini (primary), DeepSeek (fallback)"
+    echo "    Opus/Sonnet → DeepSeek (primary), Gemini (fallback)"
     echo ""
 }
 
@@ -186,7 +191,7 @@ run_benchmark() {
     echo ""
     echo "  Latency Benchmark (1 request each)"
     echo "  ==================================="
-    for name in deepseek openrouter fireworks; do
+    for name in deepseek openrouter fireworks gemini; do
         local url="" key="" model=""
         case "$name" in
             deepseek)   url="$DEEPSEEK_URL"; key="${DEEPSEEK_API_KEY:-}"; model="deepseek-v4-pro" ;;

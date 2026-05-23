@@ -106,18 +106,22 @@ if ($Status) {
 
 # --- Cost ---
 if ($Cost) {
-    Write-Host "`n  DeepSeek V4 Pro Pricing" -ForegroundColor Cyan
-    Write-Host "  =======================" -ForegroundColor DarkGray
+    Write-Host "`n  Model Pricing (per 1M tokens, May 2026)" -ForegroundColor Cyan
+    Write-Host "  =========================================" -ForegroundColor DarkGray
     Write-Host ""
     Write-Host "  Provider        Input/M    Output/M   Cache Hit/M" -ForegroundColor Yellow
     Write-Host "  ----------      --------   --------   -----------"
-    Write-Host "  DeepSeek        `$0.44      `$0.87      `$0.004" -ForegroundColor Green
+    Write-Host "  DeepSeek V4     `$0.44*     `$0.87*     `$0.004" -ForegroundColor Green
     Write-Host "  OpenRouter      `$0.44      `$0.87      (provider)"
     Write-Host "  Fireworks       `$1.74      `$3.48      (provider)"
     Write-Host "  Gemini 3.5      `$1.50      `$9.00      `$0.15"
     Write-Host "  Anthropic       `$3.00      `$15.00     `$0.30"
     Write-Host ""
-    Write-Host "  Monthly estimate (heavy use): `$30-80 vs `$200 Anthropic" -ForegroundColor Green
+    Write-Host "  * DeepSeek 75% discount until May 31, 2026." -ForegroundColor DarkGray
+    Write-Host "  Post-discount: Pro `$1.74/`$3.48 | Flash `$0.14/`$0.28" -ForegroundColor DarkGray
+    Write-Host ""
+    Write-Host "  Auto-mode routes cheapest per tier (set both keys):" -ForegroundColor DarkGray
+    Write-Host "  Haiku -> Gemini | Opus/Sonnet -> DeepSeek" -ForegroundColor DarkGray
     Write-Host ""
     exit 0
 }

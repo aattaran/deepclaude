@@ -4,10 +4,13 @@ import {
     MODEL_REMAP,
     PRICING_PER_M,
     NON_ANTHROPIC_BACKENDS,
+    ANTHROPIC_THINKING_BACKENDS,
     isHaikuModel,
     resolveAutoBackend,
     stripAllThinkingBlocks,
     stripUnsignedThinkingBlocks,
+    stripDeepSeekUnsupportedFields,
+    mapEffortToReasoning,
     normalizeThinkingBlocks,
     stripSamplingParamsOnThinking,
     normalizeOutputConfig,
@@ -292,6 +295,35 @@ describe('NON_ANTHROPIC_BACKENDS', () => {
 
     it('does NOT include fireworks', () => {
         assert.ok(!NON_ANTHROPIC_BACKENDS.has('fireworks'));
+    });
+});
+
+// ---------------------------------------------------------------------------
+// 4b. ANTHROPIC_THINKING_BACKENDS
+// ---------------------------------------------------------------------------
+describe('ANTHROPIC_THINKING_BACKENDS', () => {
+    it('contains exactly two entries', () => {
+        assert.equal(ANTHROPIC_THINKING_BACKENDS.size, 2);
+    });
+
+    it('includes deepseek', () => {
+        assert.ok(ANTHROPIC_THINKING_BACKENDS.has('deepseek'));
+    });
+
+    it('includes anthropic', () => {
+        assert.ok(ANTHROPIC_THINKING_BACKENDS.has('anthropic'));
+    });
+
+    it('does NOT include gemini', () => {
+        assert.ok(!ANTHROPIC_THINKING_BACKENDS.has('gemini'));
+    });
+
+    it('does NOT include openrouter', () => {
+        assert.ok(!ANTHROPIC_THINKING_BACKENDS.has('openrouter'));
+    });
+
+    it('does NOT include fireworks', () => {
+        assert.ok(!ANTHROPIC_THINKING_BACKENDS.has('fireworks'));
     });
 });
 
@@ -685,5 +717,231 @@ describe('warnOAuthToken', () => {
         } finally {
             console.warn = originalWarn;
         }
+    });
+});
+
+// ---------------------------------------------------------------------------
+// 11. stripDeepSeekUnsupportedFields
+// ---------------------------------------------------------------------------
+describe('stripDeepSeekUnsupportedFields', () => {
+    it('removes image blocks from content arrays', () => {
+        const body = {
+            messages: [
+                {
+                    role: 'user',
+                    content: [
+                        { type: 'text', text: 'describe this' },
+                        { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'abc' } },
+                    ],
+                },
+            ],
+        };
+        stripDeepSeekUnsupportedFields(body);
+        assert.equal(body.messages[0].content.length, 1);
+        assert.equal(body.messages[0].content[0].type, 'text');
+    });
+
+    it('removes document blocks from content arrays', () => {
+        const body = {
+            messages: [
+                {
+                    role: 'user',
+                    content: [
+                        { type: 'text', text: 'summarize' },
+                        { type: 'document', source: { type: 'text', media_type: 'text/plain', data: '...' } },
+                    ],
+                },
+            ],
+        };
+        stripDeepSeekUnsupportedFields(body);
+        assert.equal(body.messages[0].content.length, 1);
+        assert.equal(body.messages[0].content[0].type, 'text');
+    });
+
+    it('removes cache_control from content blocks', () => {
+        const body = {
+            messages: [
+                {
+                    role: 'user',
+                    content: [
+                        { type: 'text', text: 'hello', cache_control: { type: 'ephemeral' } },
+                        { type: 'text', text: 'world' },
+                    ],
+                },
+            ],
+        };
+        stripDeepSeekUnsupportedFields(body);
+        assert.equal(body.messages[0].content[0].cache_control, undefined);
+        assert.equal(body.messages[0].content[1].cache_control, undefined);
+    });
+
+    it('removes top_k from request body', () => {
+        const body = { top_k: 40, model: 'deepseek-v4-flash' };
+        stripDeepSeekUnsupportedFields(body);
+        assert.equal(body.top_k, undefined);
+        assert.equal(body.model, 'deepseek-v4-flash');
+    });
+
+    it('removes disable_parallel_tool_use from request body', () => {
+        const body = { disable_parallel_tool_use: true, model: 'deepseek-v4-flash' };
+        stripDeepSeekUnsupportedFields(body);
+        assert.equal(body.disable_parallel_tool_use, undefined);
+        assert.equal(body.model, 'deepseek-v4-flash');
+    });
+
+    it('strips multiple unsupported fields in one call', () => {
+        const body = {
+            top_k: 40,
+            disable_parallel_tool_use: true,
+            messages: [
+                {
+                    role: 'user',
+                    content: [
+                        { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'x' } },
+                        { type: 'text', text: 'hi', cache_control: { type: 'ephemeral' } },
+                    ],
+                },
+            ],
+        };
+        stripDeepSeekUnsupportedFields(body);
+        assert.equal(body.top_k, undefined);
+        assert.equal(body.disable_parallel_tool_use, undefined);
+        assert.equal(body.messages[0].content.length, 1);
+        assert.equal(body.messages[0].content[0].cache_control, undefined);
+    });
+
+    it('logs a warning when stripping fields', () => {
+        const originalWarn = console.warn;
+        const warnings = [];
+        console.warn = (...args) => warnings.push(args.join(' '));
+        try {
+            const body = { top_k: 40, messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] };
+            stripDeepSeekUnsupportedFields(body);
+            assert.equal(warnings.length, 1);
+            assert.match(warnings[0], /DeepSeek unsupported fields stripped/);
+            assert.match(warnings[0], /top_k/);
+        } finally {
+            console.warn = originalWarn;
+        }
+    });
+
+    it('does not warn when no unsupported fields are present', () => {
+        const originalWarn = console.warn;
+        const warnings = [];
+        console.warn = (...args) => warnings.push(args.join(' '));
+        try {
+            const body = { model: 'deepseek-v4-flash', messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] };
+            stripDeepSeekUnsupportedFields(body);
+            assert.equal(warnings.length, 0);
+        } finally {
+            console.warn = originalWarn;
+        }
+    });
+
+    it('preserves thinking and tool_use blocks', () => {
+        const body = {
+            messages: [
+                {
+                    role: 'assistant',
+                    content: [
+                        { type: 'thinking', thinking: 'deep thought' },
+                        { type: 'text', text: 'response' },
+                        { type: 'tool_use', id: 'tu_1', name: 'x', input: {} },
+                    ],
+                },
+                {
+                    role: 'user',
+                    content: [
+                        { type: 'tool_result', tool_use_id: 'tu_1', content: 'done' },
+                    ],
+                },
+            ],
+        };
+        stripDeepSeekUnsupportedFields(body);
+        assert.equal(body.messages[0].content.length, 3);
+        assert.equal(body.messages[1].content.length, 1);
+    });
+
+    it('handles null and undefined body', () => {
+        stripDeepSeekUnsupportedFields(null);
+        stripDeepSeekUnsupportedFields(undefined);
+    });
+
+    it('handles body without messages key', () => {
+        const body = { model: 'test' };
+        stripDeepSeekUnsupportedFields(body);
+        assert.deepEqual(body, { model: 'test' });
+    });
+
+    it('handles messages with string content (not array)', () => {
+        const body = { messages: [{ role: 'user', content: 'plain string' }] };
+        stripDeepSeekUnsupportedFields(body);
+        assert.equal(body.messages[0].content, 'plain string');
+    });
+
+    it('handles empty messages array', () => {
+        const body = { messages: [] };
+        stripDeepSeekUnsupportedFields(body);
+        assert.deepEqual(body, { messages: [] });
+    });
+});
+
+// ---------------------------------------------------------------------------
+// 12. mapEffortToReasoning
+// ---------------------------------------------------------------------------
+describe('mapEffortToReasoning', () => {
+    it('maps Anthropic effort=low to reasoning_effort=low', () => {
+        const body = { effort: 'low' };
+        mapEffortToReasoning(body);
+        assert.equal(body.reasoning_effort, 'low');
+        assert.equal(body.effort, undefined);
+    });
+
+    it('maps Anthropic effort=medium to reasoning_effort=medium', () => {
+        const body = { effort: 'medium' };
+        mapEffortToReasoning(body);
+        assert.equal(body.reasoning_effort, 'medium');
+        assert.equal(body.effort, undefined);
+    });
+
+    it('maps Anthropic effort=high to reasoning_effort=high', () => {
+        const body = { effort: 'high' };
+        mapEffortToReasoning(body);
+        assert.equal(body.reasoning_effort, 'high');
+        assert.equal(body.effort, undefined);
+    });
+
+    it('maps Anthropic effort=max to reasoning_effort=high', () => {
+        const body = { effort: 'max' };
+        mapEffortToReasoning(body);
+        assert.equal(body.reasoning_effort, 'high');
+        assert.equal(body.effort, undefined);
+    });
+
+    it('does nothing when effort is not set', () => {
+        const body = { model: 'test' };
+        mapEffortToReasoning(body);
+        assert.deepEqual(body, { model: 'test' });
+    });
+
+    it('does nothing for invalid effort values', () => {
+        const body = { effort: 'extreme' };
+        mapEffortToReasoning(body);
+        assert.equal(body.effort, 'extreme');
+        assert.equal(body.reasoning_effort, undefined);
+    });
+
+    it('preserves other fields when mapping effort', () => {
+        const body = { effort: 'high', model: 'deepseek-v4-flash', thinking: { type: 'adaptive' } };
+        mapEffortToReasoning(body);
+        assert.equal(body.reasoning_effort, 'high');
+        assert.equal(body.effort, undefined);
+        assert.equal(body.model, 'deepseek-v4-flash');
+        assert.deepEqual(body.thinking, { type: 'adaptive' });
+    });
+
+    it('handles null and undefined body', () => {
+        mapEffortToReasoning(null);
+        mapEffortToReasoning(undefined);
     });
 });
