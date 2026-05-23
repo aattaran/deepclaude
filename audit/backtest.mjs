@@ -85,20 +85,20 @@ export function runBacktest(candles, strategyFn, opts = {}) {
 
         // Check for exit if in position
         if (inPosition) {
-            const exitPrice = getExitPrice(inPosition, currentCandle, candles.slice(i), history);
-            if (exitPrice !== null) {
+            const exit = getExitPrice(inPosition, currentCandle, candles.slice(i), history);
+            if (exit !== null) {
                 // Close position
-                const pnl = calculatePnl(inPosition, exitPrice, contractSize, slippage, commission);
+                const pnl = calculatePnl(inPosition, exit.price, contractSize, slippage, commission);
                 trades.push({
                     symbol,
                     direction: inPosition.direction,
                     entry_price: inPosition.entryPrice,
-                    exit_price: exitPrice,
+                    exit_price: exit.price,
                     pnl_usd: pnl,
                     hold_sec: (currentCandle.timestamp - inPosition.entryTime) / 1000,
                     entry_time: inPosition.entryTime,
                     exit_time: currentCandle.timestamp,
-                    exit_reason: inPosition.exitReason || 'SIGNAL',
+                    exit_reason: exit.reason,
                 });
                 equity += pnl;
                 if (equity > peak) peak = equity;
@@ -201,27 +201,24 @@ export function runBacktest(candles, strategyFn, opts = {}) {
 }
 
 export function getExitPrice(position, candle, futureCandles, history = [], stopLossPercent = 0.02, takeProfitPercent = 0.04) {
-    const nextCandle = futureCandles[1];
-    if (!nextCandle) return candle.close;
-
     const entry = position.entryPrice;
 
     if (position.direction === 'long') {
         // Stop-loss: exit if price drops below entry * (1 - stopLossPercent)
         const stopPrice = entry * (1 - stopLossPercent);
-        if (candle.low <= stopPrice) return stopPrice;
+        if (candle.low <= stopPrice) return { price: stopPrice, reason: 'stop_loss' };
 
         // Take-profit: exit if price rises above entry * (1 + takeProfitPercent)
         const targetPrice = entry * (1 + takeProfitPercent);
-        if (candle.high >= targetPrice) return targetPrice;
+        if (candle.high >= targetPrice) return { price: targetPrice, reason: 'take_profit' };
     } else {
         // Stop-loss: exit if price rises above entry * (1 + stopLossPercent)
         const stopPrice = entry * (1 + stopLossPercent);
-        if (candle.high >= stopPrice) return stopPrice;
+        if (candle.high >= stopPrice) return { price: stopPrice, reason: 'stop_loss' };
 
         // Take-profit: exit if price drops below entry * (1 - takeProfitPercent)
         const targetPrice = entry * (1 - takeProfitPercent);
-        if (candle.low <= targetPrice) return targetPrice;
+        if (candle.low <= targetPrice) return { price: targetPrice, reason: 'take_profit' };
     }
 
     // SMA crossover exit — third exit condition
@@ -230,17 +227,25 @@ export function getExitPrice(position, candle, futureCandles, history = [], stop
     if (history.length >= 30) {
         const fastPeriod = 10;
         const slowPeriod = 30;
-        const fastSma = avgClose(history.slice(-fastPeriod));
-        const slowSma = avgClose(history.slice(-slowPeriod));
-        const prevFastSma = avgClose(history.slice(-fastPeriod - 1, -1));
-        const prevSlowSma = avgClose(history.slice(-slowPeriod - 1, -1));
+        // Compute both SMAs from the same endpoint: slow slice first, then fast as a subset
+        const slowSlice = history.slice(-slowPeriod);
+        const slowSma = avgClose(slowSlice);
+        const fastSma = avgClose(slowSlice.slice(-fastPeriod));
+        const prevSlowSlice = history.slice(-slowPeriod - 1, -1);
+        const prevSlowSma = avgClose(prevSlowSlice);
+        const prevFastSma = avgClose(prevSlowSlice.slice(-fastPeriod));
 
         if (position.direction === 'long' && prevFastSma >= prevSlowSma && fastSma < slowSma) {
-            return candle.close; // Bearish crossover
+            return { price: candle.close, reason: 'sma_crossover' }; // Bearish crossover
         }
         if (position.direction === 'short' && prevFastSma <= prevSlowSma && fastSma > slowSma) {
-            return candle.close; // Bullish crossover
+            return { price: candle.close, reason: 'sma_crossover' }; // Bullish crossover
         }
+    }
+
+    // Force-close at end of data (last bar) — no look-ahead, use current candle only
+    if (futureCandles.length < 2) {
+        return { price: candle.close, reason: 'end_of_data' };
     }
 
     return null; // hold
@@ -250,7 +255,8 @@ function calculatePnl(position, exitPrice, contractSize, slippage, commission) {
     const rawPnl = position.direction === 'long'
         ? (exitPrice - position.entryPrice) * contractSize
         : (position.entryPrice - exitPrice) * contractSize;
-    return rawPnl - (slippage * contractSize * 2) - (commission * 2);
+    // Entry slippage is already baked into position.entryPrice.  Do not double-count it here.
+    return rawPnl - (commission * 2);
 }
 
 function calcSharpeFromReturns(returns) {
@@ -388,10 +394,13 @@ export function generateSampleCandles(count = 500, trend = 'random') {
 export function smaCrossStrategy(candle, history, fastPeriod = 10, slowPeriod = 30) {
     if (history.length < slowPeriod) return null;
 
-    const fastSma = avgClose(history.slice(-fastPeriod));
-    const slowSma = avgClose(history.slice(-slowPeriod));
-    const prevFastSma = avgClose(history.slice(-fastPeriod - 1, -1));
-    const prevSlowSma = avgClose(history.slice(-slowPeriod - 1, -1));
+    // Compute both SMAs from the same endpoint to avoid misalignment
+    const slowSlice = history.slice(-slowPeriod);
+    const slowSma = avgClose(slowSlice);
+    const fastSma = avgClose(slowSlice.slice(-fastPeriod));
+    const prevSlowSlice = history.slice(-slowPeriod - 1, -1);
+    const prevSlowSma = avgClose(prevSlowSlice);
+    const prevFastSma = avgClose(prevSlowSlice.slice(-fastPeriod));
 
     if (prevFastSma <= prevSlowSma && fastSma > slowSma) {
         return { symbol: 'MNQ', direction: 'long', timestamp: candle.timestamp, price: candle.close, score: 0.6, metadata: { fastSma, slowSma } };

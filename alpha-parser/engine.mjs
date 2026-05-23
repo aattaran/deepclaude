@@ -89,7 +89,8 @@ export async function auditMessage(text, { fetch: _fetch = fetch } = {}) {
     for (const [i, address] of links.entries()) {
         const card = cards[i] || null;
         const dex = await fetchDexScreener(address, { fetch: _fetch });
-        const rugcheck = !card ? await fetchRugCheck(address, { fetch: _fetch }) : null; // only hit RugCheck if no card
+        const hasAuditData = card && (card.flags.length > 0 || card.warnings.length > 0);
+        const rugcheck = !hasAuditData ? await fetchRugCheck(address, { fetch: _fetch }) : null;
 
         const dexFlags = scoreDex(dex);
         const cardFlags = card ? scoreCard(card) : [];
@@ -125,10 +126,22 @@ export async function auditMessage(text, { fetch: _fetch = fetch } = {}) {
 
 export async function scanBatch(messages, { fetch: _fetch = fetch } = {}) {
     const allResults = [];
-    for (const msg of messages) {
-        const result = await scanMessage(typeof msg === 'string' ? msg : msg.text || '', { fetch: _fetch });
-        if (result) allResults.push(...result);
+    const CONCURRENCY = 5;
+
+    for (let i = 0; i < messages.length; i += CONCURRENCY) {
+        const chunk = messages.slice(i, i + CONCURRENCY);
+        const settled = await Promise.allSettled(
+            chunk.map(msg =>
+                scanMessage(typeof msg === 'string' ? msg : msg.text || '', { fetch: _fetch })
+            )
+        );
+        for (const s of settled) {
+            if (s.status === 'fulfilled' && s.value) {
+                allResults.push(...s.value);
+            }
+        }
     }
+
     return allResults;
 }
 
@@ -336,9 +349,13 @@ async function fetchDexScreener(address, { fetch: _fetch = fetch } = {}) {
         const resp = await _fetch(`${DEXSCREENER_BASE}/${address}`, {
             signal: AbortSignal.timeout(8000),
         });
-        if (!resp.ok) return null;
+        if (!resp.ok) {
+            console.warn(`[alpha-parser] DEX Screener returned ${resp.status} for ${address}`);
+            return null;
+        }
         return await resp.json();
-    } catch {
+    } catch (err) {
+        console.warn(`[alpha-parser] DEX Screener fetch failed for ${address}: ${err?.message ?? err}`);
         return null;
     }
 }
@@ -348,9 +365,13 @@ async function fetchRugCheck(address, { fetch: _fetch = fetch } = {}) {
         const resp = await _fetch(`${RUGCHECK_BASE}/${address}/report`, {
             signal: AbortSignal.timeout(8000),
         });
-        if (!resp.ok) return null;
+        if (!resp.ok) {
+            console.warn(`[alpha-parser] RugCheck returned ${resp.status} for ${address}`);
+            return null;
+        }
         return await resp.json();
-    } catch {
+    } catch (err) {
+        console.warn(`[alpha-parser] RugCheck fetch failed for ${address}: ${err?.message ?? err}`);
         return null;
     }
 }
@@ -369,7 +390,8 @@ function extractLinks(text) {
 
 async function evaluateToken(address, card, { fetch: _fetch = fetch } = {}) {
     const dex = await fetchDexScreener(address, { fetch: _fetch });
-    const rugcheck = !card ? await fetchRugCheck(address, { fetch: _fetch }) : null;
+    const hasCardAudit = card && (card.flags.length > 0 || card.warnings.length > 0);
+    const rugcheck = !hasCardAudit ? await fetchRugCheck(address, { fetch: _fetch }) : null;
 
     const dexFlags = scoreDex(dex);
     const cardFlags = card ? scoreCard(card) : [];

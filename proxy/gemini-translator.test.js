@@ -176,7 +176,32 @@ describe('translateRequest', () => {
     assert.deepEqual(geminiBody.contents[0].parts, [{
       functionResponse: {
         name: 'tu_123',
+        id: 'tu_123',
         response: { content: '{"temp":22}' },
+      },
+    }]);
+  });
+
+  it('extracts text from tool_result array content', () => {
+    const { geminiBody } = translateRequest({
+      messages: [{
+        role: 'user',
+        content: [{
+          type: 'tool_result',
+          tool_use_id: 'tu_456',
+          content: [
+            { type: 'text', text: 'Temperature: 22°C' },
+            { type: 'text', text: 'Humidity: 60%' },
+          ],
+        }],
+      }],
+    });
+    assert.equal(geminiBody.contents.length, 1);
+    assert.deepEqual(geminiBody.contents[0].parts, [{
+      functionResponse: {
+        name: 'tu_456',
+        id: 'tu_456',
+        response: { content: 'Temperature: 22°C\nHumidity: 60%' },
       },
     }]);
   });
@@ -202,6 +227,55 @@ describe('translateRequest', () => {
       { text: 'Let me check.' },
       { functionCall: { name: 'get_weather', args: { loc: 'Paris' } } },
     ]);
+  });
+
+  it('maps thinking effort to thinking_level in generationConfig', () => {
+    const low = translateRequest({
+      thinking: { type: 'enabled', effort: 'low' },
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    assert.equal(low.geminiBody.generationConfig.thinkingLevel, 'low');
+
+    const med = translateRequest({
+      thinking: { type: 'enabled', effort: 'medium' },
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    assert.equal(med.geminiBody.generationConfig.thinkingLevel, 'medium');
+
+    const high = translateRequest({
+      thinking: { type: 'enabled', effort: 'high' },
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    assert.equal(high.geminiBody.generationConfig.thinkingLevel, 'high');
+
+    const max = translateRequest({
+      thinking: { type: 'enabled', effort: 'max' },
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    assert.equal(max.geminiBody.generationConfig.thinkingLevel, 'high');
+
+    const xhigh = translateRequest({
+      thinking: { type: 'enabled', effort: 'xhigh' },
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    assert.equal(xhigh.geminiBody.generationConfig.thinkingLevel, 'high');
+  });
+
+  it('skips thinking_level when effort is not present', () => {
+    const result = translateRequest({
+      thinking: { type: 'enabled', budget_tokens: 1024 },
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    assert.equal(result.geminiBody.generationConfig, undefined);
+  });
+
+  it('silently skips output_config when Gemini does not support it', () => {
+    const result = translateRequest({
+      output_config: { format: 'text' },
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    // Gemini doesn't support output_config — should be silently ignored
+    assert.equal(result.geminiBody.generationConfig, undefined);
   });
 });
 
@@ -281,7 +355,7 @@ describe('GeminiStreamTranslator', () => {
     assert.equal(events[1].data.content_block.type, 'tool_use');
     assert.match(events[1].data.content_block.id, /^toolu_gemini_\d+_\d+$/);
     assert.equal(events[1].data.content_block.name, 'get_weather');
-    assert.deepEqual(events[1].data.content_block.input, {});
+    assert.deepEqual(events[1].data.content_block.input, { location: 'Paris' });
 
     assert.equal(events[2].event, 'content_block_delta');
     assert.equal(events[2].data.index, 0);

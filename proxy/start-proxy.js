@@ -25,7 +25,6 @@ if (targetUrl && apiKey) {
         targetUrl,
         apiKey,
         backends: hasBackends ? backends : undefined,
-        defaultMode: hasBackends ? undefined : undefined,
     });
     console.log(port);
 } else {
@@ -41,7 +40,7 @@ if (targetUrl && apiKey) {
 
     const args = process.argv.slice(2);
     const modeFlag = args.indexOf('--mode');
-    const defaultMode = modeFlag >= 0 ? args[modeFlag + 1] : 'anthropic';
+    const defaultMode = (modeFlag >= 0 && modeFlag + 1 < args.length) ? args[modeFlag + 1] : 'anthropic';
     const portFlag = args.indexOf('--port');
     const port = portFlag >= 0 ? parseInt(args[portFlag + 1], 10) : 3200;
 

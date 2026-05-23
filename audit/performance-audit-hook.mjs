@@ -31,6 +31,14 @@ export function audit(trades, opts = {}) {
     const symbol = opts.symbol || null;
     const startingEquity = opts.startingEquity || 50000;
 
+    // Bug 2: Input validation — return early for null/undefined/non-array/empty
+    if (!Array.isArray(trades) || trades.length === 0) {
+        return {
+            ...emptyResult(timeframe, symbol || 'ALL'),
+            error: 'No trades provided',
+        };
+    }
+
     // Filter
     let filtered = trades;
     if (symbol) filtered = filtered.filter(t => t.symbol === symbol);
@@ -58,7 +66,7 @@ export function audit(trades, opts = {}) {
     const equityCurve = buildEquityCurve(filtered, startingEquity);
 
     // Max Drawdown
-    const { maxDrawdown, maxDrawdownUsd } = calcMaxDrawdown(equityCurve, filtered);
+    const { maxDrawdown, maxDrawdownUsd } = calcMaxDrawdown(equityCurve);
 
     // Sharpe Ratio (annualized)
     const returns = calcPeriodReturns(equityCurve, filtered, startingEquity);
@@ -107,7 +115,7 @@ export function audit(trades, opts = {}) {
         total_pnl_usd: +totalPnl.toFixed(2),
         avg_pnl_per_trade: +avgPnl.toFixed(4),
         sharpe_ratio: +sharpe.toFixed(4),
-        sortino_ratio: +sortino.toFixed(4),
+        sortino_ratio: sortino === Infinity ? 999 : +sortino.toFixed(4),
         max_drawdown: +maxDrawdown.toFixed(4),
         max_drawdown_usd: +maxDrawdownUsd.toFixed(2),
         profit_factor: profitFactor === Infinity ? 999 : +profitFactor.toFixed(4),
@@ -120,7 +128,7 @@ export function audit(trades, opts = {}) {
 function buildEquityCurve(trades, startingEquity = 50000) {
     const sorted = [...trades].sort((a, b) => a.exit_time - b.exit_time);
     let equity = startingEquity;
-    const curve = [{ timestamp: sorted[0]?.entry_time || Date.now(), equity }];
+    const curve = [{ timestamp: trades[0].entry_time, equity: startingEquity }];
     for (const t of sorted) {
         equity += t.pnl_usd;
         curve.push({ timestamp: t.exit_time, equity });
@@ -128,7 +136,7 @@ function buildEquityCurve(trades, startingEquity = 50000) {
     return curve;
 }
 
-function calcMaxDrawdown(equityCurve, _trades) {
+function calcMaxDrawdown(equityCurve) {
     let peak = equityCurve[0]?.equity || 0;
     let maxDD = 0;
     let maxDDUsd = 0;
@@ -178,7 +186,7 @@ function calcSortino(dailyReturns) {
     if (dailyReturns.length < 2) return 0;
     const mean = dailyReturns.reduce((s, r) => s + r, 0) / dailyReturns.length;
     const downReturns = dailyReturns.filter(r => r < 0);
-    if (downReturns.length === 0) return mean > 0 ? 10 : 0; // no downside = excellent
+    if (downReturns.length === 0) return mean > 0 ? Infinity : 0; // no downside = infinite Sortino
     const downVariance = downReturns.reduce((s, r) => s + r ** 2, 0) / downReturns.length;
     const downStdDev = Math.sqrt(downVariance);
     if (downStdDev === 0) return 0;

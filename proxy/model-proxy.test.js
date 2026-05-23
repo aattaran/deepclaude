@@ -8,6 +8,11 @@ import {
     resolveAutoBackend,
     stripAllThinkingBlocks,
     stripUnsignedThinkingBlocks,
+    normalizeThinkingBlocks,
+    stripSamplingParamsOnThinking,
+    normalizeOutputConfig,
+    filterAssistantPrefill,
+    warnOAuthToken,
 } from './model-proxy.js';
 
 // ---------------------------------------------------------------------------
@@ -430,5 +435,255 @@ describe('stripUnsignedThinkingBlocks', () => {
         const body = { messages: [{ role: 'user', content: 'plain string' }] };
         stripUnsignedThinkingBlocks(body);
         assert.equal(body.messages[0].content, 'plain string');
+    });
+});
+
+// ---------------------------------------------------------------------------
+// 6. Anthropic API compatibility: normalizeThinkingBlocks
+// ---------------------------------------------------------------------------
+describe('normalizeThinkingBlocks', () => {
+    it('converts old budget_tokens ≤1024 to adaptive + effort=low', () => {
+        const body = { thinking: { type: 'enabled', budget_tokens: 512 } };
+        normalizeThinkingBlocks(body);
+        assert.deepEqual(body.thinking, { type: 'adaptive' });
+        assert.equal(body.effort, 'low');
+    });
+
+    it('maps budget_tokens ≤4096 to effort=medium', () => {
+        const body = { thinking: { type: 'enabled', budget_tokens: 2048 } };
+        normalizeThinkingBlocks(body);
+        assert.equal(body.effort, 'medium');
+    });
+
+    it('maps budget_tokens ≤8192 to effort=high', () => {
+        const body = { thinking: { type: 'enabled', budget_tokens: 6000 } };
+        normalizeThinkingBlocks(body);
+        assert.equal(body.effort, 'high');
+    });
+
+    it('maps budget_tokens >8192 to effort=max', () => {
+        const body = { thinking: { type: 'enabled', budget_tokens: 10000 } };
+        normalizeThinkingBlocks(body);
+        assert.equal(body.effort, 'max');
+    });
+
+    it('does nothing if thinking is already adaptive', () => {
+        const body = { thinking: { type: 'adaptive' }, effort: 'high' };
+        normalizeThinkingBlocks(body);
+        assert.deepEqual(body.thinking, { type: 'adaptive' });
+        assert.equal(body.effort, 'high');
+    });
+
+    it('does nothing if thinking is missing', () => {
+        const body = { model: 'claude-opus-4-7' };
+        normalizeThinkingBlocks(body);
+        assert.deepEqual(body, { model: 'claude-opus-4-7' });
+    });
+
+    it('handles null and undefined body', () => {
+        normalizeThinkingBlocks(null);
+        normalizeThinkingBlocks(undefined);
+    });
+
+    it('does nothing for non-enabled thinking type', () => {
+        const body = { thinking: { type: 'disabled' } };
+        normalizeThinkingBlocks(body);
+        assert.deepEqual(body.thinking, { type: 'disabled' });
+    });
+});
+
+// ---------------------------------------------------------------------------
+// 7. Anthropic API compatibility: stripSamplingParamsOnThinking
+// ---------------------------------------------------------------------------
+describe('stripSamplingParamsOnThinking', () => {
+    it('removes temperature, top_p, top_k when thinking is adaptive', () => {
+        const body = {
+            thinking: { type: 'adaptive' },
+            temperature: 0.7,
+            top_p: 0.9,
+            top_k: 40,
+            max_tokens: 1000,
+        };
+        stripSamplingParamsOnThinking(body);
+        assert.equal(body.temperature, undefined);
+        assert.equal(body.top_p, undefined);
+        assert.equal(body.top_k, undefined);
+        assert.equal(body.max_tokens, 1000); // preserved
+    });
+
+    it('does nothing when thinking is not set', () => {
+        const body = { temperature: 0.7, max_tokens: 1000 };
+        stripSamplingParamsOnThinking(body);
+        assert.equal(body.temperature, 0.7);
+        assert.equal(body.max_tokens, 1000);
+    });
+
+    it('does nothing when thinking type is not adaptive', () => {
+        const body = {
+            thinking: { type: 'enabled', budget_tokens: 4096 },
+            temperature: 0.7,
+        };
+        stripSamplingParamsOnThinking(body);
+        assert.equal(body.temperature, 0.7);
+    });
+
+    it('handles null and undefined body', () => {
+        stripSamplingParamsOnThinking(null);
+        stripSamplingParamsOnThinking(undefined);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// 8. Anthropic API compatibility: normalizeOutputConfig
+// ---------------------------------------------------------------------------
+describe('normalizeOutputConfig', () => {
+    it('converts output_format string to output_config object', () => {
+        const body = { output_format: 'text' };
+        normalizeOutputConfig(body);
+        assert.deepEqual(body.output_config, { format: 'text' });
+        assert.equal(body.output_format, undefined);
+    });
+
+    it('does nothing if output_config already present', () => {
+        const body = { output_config: { format: 'text' }, output_format: 'text' };
+        normalizeOutputConfig(body);
+        assert.deepEqual(body.output_config, { format: 'text' });
+        assert.equal(body.output_format, undefined);
+    });
+
+    it('does nothing if neither field is present', () => {
+        const body = { model: 'claude-opus-4-7' };
+        normalizeOutputConfig(body);
+        assert.deepEqual(body, { model: 'claude-opus-4-7' });
+    });
+
+    it('handles null and undefined body', () => {
+        normalizeOutputConfig(null);
+        normalizeOutputConfig(undefined);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// 9. Anthropic API compatibility: filterAssistantPrefill
+// ---------------------------------------------------------------------------
+describe('filterAssistantPrefill', () => {
+    it('strips assistant message with empty content array', () => {
+        const body = {
+            messages: [
+                { role: 'user', content: 'hello' },
+                { role: 'assistant', content: [] },
+                { role: 'user', content: 'world' },
+            ],
+        };
+        filterAssistantPrefill(body);
+        assert.equal(body.messages.length, 2);
+        assert.equal(body.messages[0].role, 'user');
+        assert.equal(body.messages[1].role, 'user');
+    });
+
+    it('strips assistant message with missing content field', () => {
+        const body = {
+            messages: [
+                { role: 'user', content: 'hello' },
+                { role: 'assistant' },
+            ],
+        };
+        filterAssistantPrefill(body);
+        assert.equal(body.messages.length, 1);
+    });
+
+    it('preserves assistant message with valid content', () => {
+        const body = {
+            messages: [
+                { role: 'user', content: 'hello' },
+                { role: 'assistant', content: [{ type: 'text', text: 'world' }] },
+            ],
+        };
+        filterAssistantPrefill(body);
+        assert.equal(body.messages.length, 2);
+    });
+
+    it('preserves all user messages unchanged', () => {
+        const body = {
+            messages: [
+                { role: 'user', content: 'hello' },
+                { role: 'user', content: 'world' },
+            ],
+        };
+        filterAssistantPrefill(body);
+        assert.equal(body.messages.length, 2);
+    });
+
+    it('handles null and undefined body', () => {
+        filterAssistantPrefill(null);
+        filterAssistantPrefill(undefined);
+    });
+
+    it('handles body without messages key', () => {
+        const body = { model: 'test' };
+        filterAssistantPrefill(body);
+        assert.deepEqual(body, { model: 'test' });
+    });
+
+    it('handles empty messages array', () => {
+        const body = { messages: [] };
+        filterAssistantPrefill(body);
+        assert.deepEqual(body, { messages: [] });
+    });
+});
+
+// ---------------------------------------------------------------------------
+// 10. Anthropic API compatibility: warnOAuthToken
+// ---------------------------------------------------------------------------
+describe('warnOAuthToken', () => {
+    it('logs warning for sk-ant-oat keys', () => {
+        const originalWarn = console.warn;
+        const warnings = [];
+        console.warn = (...args) => warnings.push(args.join(' '));
+        try {
+            warnOAuthToken('sk-ant-oat-abc123');
+            assert.equal(warnings.length, 1);
+            assert.match(warnings[0], /OAuth API key/);
+            assert.match(warnings[0], /sk-ant-api03/);
+        } finally {
+            console.warn = originalWarn;
+        }
+    });
+
+    it('does not warn for sk-ant-api03 keys', () => {
+        const originalWarn = console.warn;
+        const warnings = [];
+        console.warn = (...args) => warnings.push(args.join(' '));
+        try {
+            warnOAuthToken('sk-ant-api03-abc123');
+            assert.equal(warnings.length, 0);
+        } finally {
+            console.warn = originalWarn;
+        }
+    });
+
+    it('does not warn for null or undefined', () => {
+        const originalWarn = console.warn;
+        const warnings = [];
+        console.warn = (...args) => warnings.push(args.join(' '));
+        try {
+            warnOAuthToken(null);
+            warnOAuthToken(undefined);
+            assert.equal(warnings.length, 0);
+        } finally {
+            console.warn = originalWarn;
+        }
+    });
+
+    it('does not warn for empty string', () => {
+        const originalWarn = console.warn;
+        const warnings = [];
+        console.warn = (...args) => warnings.push(args.join(' '));
+        try {
+            warnOAuthToken('');
+            assert.equal(warnings.length, 0);
+        } finally {
+            console.warn = originalWarn;
+        }
     });
 });

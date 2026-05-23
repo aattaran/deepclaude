@@ -195,36 +195,48 @@ describe('performance-audit-hook.mjs', () => {
 describe('backtest.mjs', () => {
   describe('getExitPrice', () => {
     const entryPrice = 100;
-    const futureCandles = [{}, {}]; // need futureCandles[1] to exist
+    const futureCandles = [{}, {}]; // need at least 2 so it's not end-of-data
 
     it('triggers stop-loss when price drops 3% below entry for a long', () => {
       const position = { direction: 'long', entryPrice };
       const candle = { open: 98, high: 99, low: 95, close: 96, timestamp: 2000 };
 
-      // stopPrice = 100 * (1 - 0.03) = 97; candle.low (95) <= 97 → trigger
+      // stopPrice = 100 * (1 - 0.03) = 97; candle.low (95) <= 97 -> trigger
       const exit = getExitPrice(position, candle, futureCandles, [], 0.03, 0.05);
-      assert.equal(exit, 97);
+      assert.equal(exit.price, 97);
+      assert.equal(exit.reason, 'stop_loss');
     });
 
     it('triggers take-profit when price rises 5% above entry for a long', () => {
       const position = { direction: 'long', entryPrice };
       const candle = { open: 100, high: 107, low: 99, close: 106, timestamp: 2000 };
 
-      // stopPrice = 97, candle.low (99) > 97 → stop skipped
-      // targetPrice = 105, candle.high (107) >= 105 → trigger
+      // stopPrice = 97, candle.low (99) > 97 -> stop skipped
+      // targetPrice = 105, candle.high (107) >= 105 -> trigger
       const exit = getExitPrice(position, candle, futureCandles, [], 0.03, 0.05);
-      assert.equal(exit, 105);
+      assert.equal(exit.price, 105);
+      assert.equal(exit.reason, 'take_profit');
     });
 
     it('returns null (hold) when no exit condition is met', () => {
       const position = { direction: 'long', entryPrice };
       const candle = { open: 100, high: 102, low: 98.5, close: 101, timestamp: 2000 };
 
-      // stopPrice = 97, candle.low (98.5) > 97 → no stop
-      // targetPrice = 105, candle.high (102) < 105 → no TP
-      // history.length < 30 → no SMA crossover → hold
+      // stopPrice = 97, candle.low (98.5) > 97 -> no stop
+      // targetPrice = 105, candle.high (102) < 105 -> no TP
+      // history.length < 30 -> no SMA crossover -> hold
       const exit = getExitPrice(position, candle, futureCandles, [], 0.03, 0.05);
       assert.strictEqual(exit, null);
+    });
+
+    it('forces exit at end of data with end_of_data reason', () => {
+      const position = { direction: 'long', entryPrice };
+      const candle = { open: 100, high: 102, low: 98.5, close: 101, timestamp: 2000 };
+
+      // Only 1 futureCandle signals end of data -> force close
+      const exit = getExitPrice(position, candle, [{}], [], 0.03, 0.05);
+      assert.equal(exit.price, 101);
+      assert.equal(exit.reason, 'end_of_data');
     });
   });
 });

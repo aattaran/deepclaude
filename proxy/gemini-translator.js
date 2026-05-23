@@ -51,7 +51,7 @@ export function translateRequest(anthropicBody) {
             if (msg.role === 'assistant' && Array.isArray(msg.content)) {
                 for (const block of msg.content) {
                     if (block.type === 'tool_use' && block.id && block.name) {
-                        toolUseMap.set(block.id, block.name);
+                        toolUseMap.set(block.id, { name: block.name, id: block.id });
                     }
                 }
             }
@@ -102,6 +102,31 @@ export function translateRequest(anthropicBody) {
     if (Array.isArray(parsed.stop_sequences) && parsed.stop_sequences.length > 0) {
         genConfig.stopSequences = parsed.stop_sequences;
     }
+    // thinking → thinking_level (Gemini replaced thinking_budget with thinking_level enum)
+    if (parsed.thinking) {
+        const effort = parsed.thinking.effort;
+        if (effort) {
+            const levelMap = {
+                'low': 'low',
+                'medium': 'medium',
+                'high': 'high',
+                'max': 'high',
+                'xhigh': 'high',
+            };
+            const tl = levelMap[effort];
+            if (tl) {
+                genConfig.thinkingLevel = tl;
+            }
+        }
+    }
+
+    // output_config → Gemini response format (if supported)
+    // Anthropic replaced output_format with output_config.
+    // Gemini does not currently support this, so we silently skip.
+    if (parsed.output_config) {
+        // Future: map to Gemini responseMimeType or responseSchema when available
+    }
+
     if (Object.keys(genConfig).length > 0) {
         gemini.generationConfig = genConfig;
     }
@@ -117,6 +142,21 @@ function extractTexts(system) {
             .map(block => block.text);
     }
     return [];
+}
+
+/**
+ * Extract text from a tool_result content field.
+ * Anthropic tool_result.content is an array of content blocks like
+ * [{type: "text", text: "result"}]. Extract .text from text blocks
+ * and join with newlines instead of JSON-stringifying the whole array.
+ */
+function extractToolResultText(content) {
+    if (typeof content === 'string') return content;
+    if (!Array.isArray(content)) return JSON.stringify(content);
+    return content
+        .filter(b => b.type === 'text')
+        .map(b => b.text)
+        .join('\n');
 }
 
 function convertMessage(msg, toolUseMap = new Map()) {
@@ -146,14 +186,17 @@ function convertMessage(msg, toolUseMap = new Map()) {
         } else if (block.type === 'tool_result') {
             // Resolve function name from tool_use_id. Gemini requires the
             // actual function name, not the Anthropic UUID.
-            const fnName = toolUseMap.get(block.tool_use_id) || block.tool_use_id || 'unknown';
+            const fnEntry = toolUseMap.get(block.tool_use_id);
+            const fnName = fnEntry?.name || block.tool_use_id || 'unknown';
+            const fnId = fnEntry?.id || block.tool_use_id;
+            // tool_result.content is an array of content blocks like
+            // [{type: "text", text: "result"}]. Extract text parts explicitly
+            // rather than JSON-stringifying the entire array.
+            const contentText = extractToolResultText(block.content);
             toolResults.push({
                 name: fnName,
-                response: {
-                    content: typeof block.content === 'string'
-                        ? block.content
-                        : JSON.stringify(block.content),
-                },
+                id: fnId,
+                response: { content: contentText },
             });
         } else if (block.type === 'image' && block.source) {
             parts.push({
@@ -365,7 +408,7 @@ export class GeminiStreamTranslator extends Transform {
                 type: 'tool_use',
                 id: toolId,
                 name: functionCall.name,
-                input: {},
+                input: toolInput,
             },
         })}\n\n`);
 

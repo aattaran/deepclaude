@@ -176,6 +176,91 @@ function stripUnsignedThinkingBlocks(body) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Anthropic API compatibility fixes (May 2026 breaking changes)
+// ---------------------------------------------------------------------------
+
+/**
+ * Convert old `thinking: {"type": "enabled", "budget_tokens": N}` to new
+ * `thinking: {"type": "adaptive"}` with a top-level `effort` parameter.
+ * Budget mapping: ≤1024 → low, ≤4096 → medium, ≤8192 → high, >8192 → max.
+ */
+function normalizeThinkingBlocks(body) {
+    if (!body?.thinking) return;
+    if (body.thinking.type === 'enabled' && typeof body.thinking.budget_tokens === 'number') {
+        const budget = body.thinking.budget_tokens;
+        let effort = 'max';
+        if (budget <= 1024) effort = 'low';
+        else if (budget <= 4096) effort = 'medium';
+        else if (budget <= 8192) effort = 'high';
+        body.thinking = { type: 'adaptive' };
+        body.effort = effort;
+    }
+}
+
+/**
+ * Strip sampling parameters (temperature, top_p, top_k) when thinking is
+ * active, because Anthropic rejects these alongside extended thinking.
+ */
+function stripSamplingParamsOnThinking(body) {
+    if (!body?.thinking) return;
+    if (body.thinking.type === 'adaptive') {
+        delete body.temperature;
+        delete body.top_p;
+        delete body.top_k;
+    }
+}
+
+/**
+ * Normalize the renamed `output_format` → `output_config` field.  The old API
+ * used a top-level `output_format` string; the new API expects
+ * `output_config: { format: "..." }`.
+ */
+function normalizeOutputConfig(body) {
+    if (!body) return;
+    if ('output_format' in body) {
+        if (!('output_config' in body)) {
+            body.output_config = { format: body.output_format };
+        }
+        delete body.output_format;
+    }
+}
+
+/**
+ * Filter out assistant messages with empty content arrays (prefill blocks).
+ * Anthropic now returns 400 for such messages.
+ */
+function filterAssistantPrefill(body) {
+    if (!body?.messages) return;
+    body.messages = body.messages.filter(msg => {
+        if (msg.role === 'assistant') {
+            return Array.isArray(msg.content) && msg.content.length > 0;
+        }
+        return true;
+    });
+}
+
+/**
+ * Warn if an OAuth token (sk-ant-oat*) is detected. OAuth tokens are blocked
+ * from 3rd-party tools; users must switch to sk-ant-api03-* keys.
+ */
+function warnOAuthToken(apiKey) {
+    if (typeof apiKey === 'string' && apiKey.startsWith('sk-ant-oat')) {
+        console.warn('[MODEL-PROXY] WARNING: Detected OAuth API key (sk-ant-oat*). OAuth tokens are blocked from 3rd-party tools. Use sk-ant-api03-* keys instead.');
+    }
+}
+
+/**
+ * Apply all Anthropic API compatibility fixes to a parsed request body.
+ */
+function normalizeAnthropicRequestBody(body) {
+    if (!body) return;
+    normalizeOutputConfig(body);
+    filterAssistantPrefill(body);
+    normalizeThinkingBlocks(body);
+    stripSamplingParamsOnThinking(body);
+}
+
 export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends, defaultMode }) {
     return new Promise((resolve, reject) => {
         const initialTarget = new URL(targetUrl);
@@ -201,6 +286,14 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
             useBearer: startBackend ? startBackend.useBearer : initialBearer,
             hadNonAnthropicSession: !!startBackend,
         };
+
+        // Warn about deprecated OAuth tokens
+        warnOAuthToken(apiKey);
+        if (backends) {
+            for (const [, cfg] of Object.entries(backends)) {
+                warnOAuthToken(cfg.apiKey);
+            }
+        }
 
         // Auto-detect Gemini legacy mode — targetUrl contains generativelanguage
         if (state.mode === '_single' && state.target.hostname.includes('generativelanguage')) {
@@ -490,6 +583,15 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
                         console.error(`[MODEL-PROXY] #${reqId} Gemini translate error: ${e.message}`);
                     }
                 } else {
+                    // Apply Anthropic API compatibility fixes (May 2026 breaking changes)
+                    if (MODEL_PATHS.includes(urlPath)) {
+                        try {
+                            const parsed = JSON.parse(body);
+                            normalizeAnthropicRequestBody(parsed);
+                            body = Buffer.from(JSON.stringify(parsed));
+                        } catch { /* pass through */ }
+                    }
+
                     // Strip thinking blocks before forwarding
                     if (isAnthropicMode && MODEL_PATHS.includes(urlPath)) {
                         try {
@@ -697,4 +799,10 @@ export {
     resolveAutoBackend,
     stripAllThinkingBlocks,
     stripUnsignedThinkingBlocks,
+    normalizeThinkingBlocks,
+    stripSamplingParamsOnThinking,
+    normalizeOutputConfig,
+    filterAssistantPrefill,
+    warnOAuthToken,
+    normalizeAnthropicRequestBody,
 };
