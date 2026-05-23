@@ -687,3 +687,14 @@ export function startModelProxy({ targetUrl, apiKey, startPort = 3200, backends,
         tryListen(startPort);
     });
 }
+
+export {
+    MODEL_REMAP,
+    PRICING_PER_M,
+    NON_ANTHROPIC_BACKENDS,
+    AUTO_ROUTE,
+    isHaikuModel,
+    resolveAutoBackend,
+    stripAllThinkingBlocks,
+    stripUnsignedThinkingBlocks,
+};

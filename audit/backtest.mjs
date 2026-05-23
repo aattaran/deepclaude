@@ -200,7 +200,7 @@ export function runBacktest(candles, strategyFn, opts = {}) {
     };
 }
 
-function getExitPrice(position, candle, futureCandles, history = [], stopLossPercent = 0.02, takeProfitPercent = 0.04) {
+export function getExitPrice(position, candle, futureCandles, history = [], stopLossPercent = 0.02, takeProfitPercent = 0.04) {
     const nextCandle = futureCandles[1];
     if (!nextCandle) return candle.close;
 
