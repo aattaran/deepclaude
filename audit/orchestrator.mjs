@@ -70,22 +70,33 @@ function signalsFromZones(activeZones, currentPrice) {
         }
     }
 
-    // Support strength → positive signal
-    if (supportStrength > 0) {
-        signals.push({ source: 'zone-detector', name: 'zone_support', value: supportStrength, confidence: 0.7 });
+    // Emit only the DOMINANT zone direction to prevent self-cancellation.
+    // If support and resistance are roughly equal, both are skipped (uncertain).
+    const strengthDiff = supportStrength - resistanceStrength;
+    const SIGNIFICANCE_THRESHOLD = 0.15;
+
+    if (Math.abs(strengthDiff) > SIGNIFICANCE_THRESHOLD) {
+        const dominantValue = Math.abs(strengthDiff);
+        const dominantConf = 0.5 + Math.min(dominantValue * 0.5, 0.35);
+        if (strengthDiff > 0) {
+            signals.push({ source: 'zone-detector', name: 'zone_support_dominant', value: dominantValue, confidence: dominantConf });
+        } else {
+            signals.push({ source: 'zone-detector', name: 'zone_resistance_dominant', value: -dominantValue, confidence: dominantConf });
+        }
     }
 
-    // Resistance strength → negative signal
-    if (resistanceStrength > 0) {
-        signals.push({ source: 'zone-detector', name: 'zone_resistance', value: -resistanceStrength, confidence: 0.7 });
-    }
-
-    // Risk/reward from zone distances
+    // Risk/reward from zone distances (asymmetric — only when clearly favorable)
     if (nearestSupportDist < Infinity && nearestResistanceDist < Infinity) {
         const rr = nearestResistanceDist / Math.max(nearestSupportDist, 0.0001);
-        // Favorable RR (>2) → bullish bias
-        const rrSignal = Math.min((rr - 1) / 2, 1); // 0-1, where RR=3 → 1.0
-        signals.push({ source: 'zone-detector', name: 'zone_rr_ratio', value: rrSignal, confidence: 0.5 });
+        if (rr > 1.5) {
+            // Favorable RR — closer support, further resistance = bullish bias
+            const rrSignal = Math.min((rr - 1) / 2, 1);
+            signals.push({ source: 'zone-detector', name: 'zone_rr_favorable', value: rrSignal, confidence: 0.5 });
+        } else if (rr < 0.67) {
+            // Inverse — closer resistance, further support = bearish bias
+            const rrSignal = -Math.min((1 / Math.max(rr, 0.01) - 1) / 2, 1);
+            signals.push({ source: 'zone-detector', name: 'zone_rr_favorable', value: rrSignal, confidence: 0.5 });
+        }
     }
 
     return signals;
