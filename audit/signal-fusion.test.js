@@ -782,10 +782,10 @@ describe('SignalQualityAnalyzer', () => {
             `expected calibrationError ~${expectedError}, got ${report.alpha.calibrationError}`);
     });
 
-    it('includes all 5 valid sources in the report', () => {
+    it('includes all valid sources in the report', () => {
         const analyzer = new SignalQualityAnalyzer();
         const report = analyzer.getReliabilityReport();
-        const expectedSources = ['alpha', 'microstructure', 'liquidity', 'backtest', 'sentiment'];
+        const expectedSources = ['alpha', 'microstructure', 'liquidity', 'backtest', 'sentiment', 'zone-detector', 'market-regime', 'confluence', 'smc', 'order-book', 'volume-profile'];
         assert.deepEqual(Object.keys(report).sort(), expectedSources.sort());
     });
 });

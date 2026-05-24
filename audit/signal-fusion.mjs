@@ -20,7 +20,7 @@
 // ---------------------------------------------------------------------------
 
 /** Valid signal source identifiers. */
-export const VALID_SOURCES = ['alpha', 'microstructure', 'liquidity', 'backtest', 'sentiment'];
+export const VALID_SOURCES = ['alpha', 'microstructure', 'liquidity', 'backtest', 'sentiment', 'zone-detector', 'market-regime', 'confluence', 'smc', 'order-book', 'volume-profile'];
 
 /** Valid fusion method names. */
 export const VALID_METHODS = ['weighted', 'bayesian', 'voting'];
@@ -32,6 +32,12 @@ export const DEFAULT_WEIGHTS = {
     liquidity: 0.20,
     backtest: 0.15,
     sentiment: 0.10,
+    'zone-detector': 0.25,
+    'market-regime': 0.20,
+    'confluence': 0.15,
+    'smc': 0.20,
+    'order-book': 0.15,
+    'volume-profile': 0.10,
 };
 
 const DEFAULT_MIN_CONFIDENCE = 0.6;
