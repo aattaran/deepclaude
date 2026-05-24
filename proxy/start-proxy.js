@@ -2,9 +2,13 @@
 import { startModelProxy } from './model-proxy.js';
 
 const BACKEND_DEFS = {
+    // DeepSeek Anthropic-compatible endpoint — accepts Anthropic SDK format natively.
+    // Supports: thinking, reasoning_effort, tool_use, tool_result blocks.
+    // Does NOT support: image, document, cache_control, top_k, disable_parallel_tool_use.
     deepseek: { url: 'https://api.deepseek.com/anthropic', keyEnv: 'DEEPSEEK_API_KEY' },
     openrouter: { url: 'https://openrouter.ai/api/v1', keyEnv: 'OPENROUTER_API_KEY' },
     fireworks: { url: 'https://api.fireworks.ai/inference/v1', keyEnv: 'FIREWORKS_API_KEY' },
+    gemini: { url: 'https://generativelanguage.googleapis.com', keyEnv: 'GEMINI_API_KEY' },
 };
 
 // Legacy mode: start-proxy.js <targetUrl> <apiKey> (used by deepclaude.sh/ps1)
@@ -24,7 +28,6 @@ if (targetUrl && apiKey) {
         targetUrl,
         apiKey,
         backends: hasBackends ? backends : undefined,
-        defaultMode: hasBackends ? undefined : undefined,
     });
     console.log(port);
 } else {
@@ -40,7 +43,7 @@ if (targetUrl && apiKey) {
 
     const args = process.argv.slice(2);
     const modeFlag = args.indexOf('--mode');
-    const defaultMode = modeFlag >= 0 ? args[modeFlag + 1] : 'anthropic';
+    const defaultMode = (modeFlag >= 0 && modeFlag + 1 < args.length) ? args[modeFlag + 1] : 'anthropic';
     const portFlag = args.indexOf('--port');
     const port = portFlag >= 0 ? parseInt(args[portFlag + 1], 10) : 3200;
 

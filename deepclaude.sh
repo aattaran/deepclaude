@@ -10,6 +10,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEEPSEEK_URL="https://api.deepseek.com/anthropic"
 OPENROUTER_URL="https://openrouter.ai/api"
 FIREWORKS_URL="https://api.fireworks.ai/inference"
+GEMINI_URL="https://generativelanguage.googleapis.com"
 
 BACKEND="${CHEAPCLAUDE_DEFAULT_BACKEND:-ds}"
 ACTION="launch"
@@ -69,8 +70,17 @@ resolve_backend() {
             haiku="accounts/fireworks/models/deepseek-v4-pro"
             subagent="accounts/fireworks/models/deepseek-v4-pro"
             ;;
+        gemini)
+            key="${GEMINI_API_KEY:-}"
+            [[ -z "$key" ]] && { echo "ERROR: GEMINI_API_KEY not set" >&2; exit 1; }
+            url="$GEMINI_URL"
+            opus="gemini-3.5-flash"
+            sonnet="gemini-3.5-flash"
+            haiku="gemini-3.5-flash"
+            subagent="gemini-3.5-flash"
+            ;;
         anthropic) ;;
-        *) echo "ERROR: Unknown backend '$BACKEND'. Use: ds, or, fw, anthropic" >&2; exit 1 ;;
+        *) echo "ERROR: Unknown backend '$BACKEND'. Use: ds, or, fw, gemini, anthropic" >&2; exit 1 ;;
     esac
     RESOLVED_URL="$url"; RESOLVED_KEY="$key"
     RESOLVED_OPUS="$opus"; RESOLVED_SONNET="$sonnet"
@@ -94,11 +104,13 @@ show_status() {
     echo "    DEEPSEEK_API_KEY:    $(mask_key "${DEEPSEEK_API_KEY:-}")"
     echo "    OPENROUTER_API_KEY:  $(mask_key "${OPENROUTER_API_KEY:-}")"
     echo "    FIREWORKS_API_KEY:   $(mask_key "${FIREWORKS_API_KEY:-}")"
+    echo "    GEMINI_API_KEY:      $(mask_key "${GEMINI_API_KEY:-}")"
     echo ""
     echo "  Backends:"
     echo "    deepclaude                  # DeepSeek V4 Pro (default)"
     echo "    deepclaude -b or            # OpenRouter (cheapest)"
     echo "    deepclaude -b fw            # Fireworks AI (fastest)"
+    echo "    deepclaude -b gemini        # Gemini 3.5 Flash (Google)"
     echo "    deepclaude -b anthropic     # Normal Claude Code"
     echo "    deepclaude --remote         # Remote control + DeepSeek"
     echo "    deepclaude --remote -b or   # Remote control + OpenRouter"
@@ -116,17 +128,23 @@ show_status() {
 
 show_cost() {
     echo ""
-    echo "  DeepSeek V4 Pro Pricing"
-    echo "  ======================="
+    echo "  Model Pricing (per 1M tokens, May 2026)"
+    echo "  ========================================="
     echo ""
-    echo "  Provider        Input/M    Output/M   Cache Hit/M"
-    echo "  ----------      --------   --------   -----------"
-    echo "  DeepSeek        \$0.44      \$0.87      \$0.004"
-    echo "  OpenRouter      \$0.44      \$0.87      (provider)"
-    echo "  Fireworks       \$1.74      \$3.48      (provider)"
+    echo "  Provider        Input/M    Output/M   Cache/M"
+    echo "  ----------      --------   --------   ------"
+    echo "  DeepSeek V4     \$0.44*     \$0.87*     \$0.004"
+    echo "  OpenRouter      \$0.44      \$0.87      -"
+    echo "  Fireworks       \$1.74      \$3.48      -"
+    echo "  Gemini 3.5      \$1.50      \$9.00      \$0.15"
     echo "  Anthropic       \$3.00      \$15.00     \$0.30"
     echo ""
-    echo "  Monthly estimate (heavy use, 25 days): \$30-80"
+    echo "  * DeepSeek 75% discount until May 31, post-discount:"
+    echo "    Pro: \$1.74/\$3.48/M | Flash: \$0.14/\$0.28/M"
+    echo ""
+    echo "  Auto-mode routes cheapest model per tier:"
+    echo "    Haiku → Gemini (primary), DeepSeek (fallback)"
+    echo "    Opus/Sonnet → DeepSeek (primary), Gemini (fallback)"
     echo ""
 }
 
@@ -136,7 +154,7 @@ show_help() {
     echo "Usage: deepclaude [options] [-- claude-args...]"
     echo ""
     echo "Options:"
-    echo "  -b, --backend <ds|or|fw|anthropic>  Backend (default: ds)"
+    echo "  -b, --backend <ds|or|fw|gemini|anthropic>  Backend (default: ds)"
     echo "  -r, --remote                        Remote control mode (browser URL)"
     echo "  --status                             Show keys and backends"
     echo "  --cost                               Pricing comparison"
@@ -148,6 +166,7 @@ show_help() {
     echo "  DEEPSEEK_API_KEY      DeepSeek API key (required for ds)"
     echo "  OPENROUTER_API_KEY    OpenRouter API key (required for or)"
     echo "  FIREWORKS_API_KEY     Fireworks API key (required for fw)"
+    echo "  GEMINI_API_KEY        Google Gemini API key (required for gemini)"
     echo "  CHEAPCLAUDE_DEFAULT_BACKEND  Default backend (default: ds)"
 }
 
@@ -157,8 +176,9 @@ do_switch() {
         ds|deepseek)   backend="deepseek" ;;
         or|openrouter) backend="openrouter" ;;
         fw|fireworks)  backend="fireworks" ;;
+        gemini)        backend="gemini" ;;
         anthropic)     backend="anthropic" ;;
-        *) echo "ERROR: Unknown backend '$backend'. Use: ds, or, fw, anthropic" >&2; exit 1 ;;
+        *) echo "ERROR: Unknown backend '$backend'. Use: ds, or, fw, gemini, anthropic" >&2; exit 1 ;;
     esac
     local resp
     resp=$(curl -sX POST http://127.0.0.1:3200/_proxy/mode -d "backend=$backend" 2>/dev/null) || {
@@ -171,7 +191,7 @@ run_benchmark() {
     echo ""
     echo "  Latency Benchmark (1 request each)"
     echo "  ==================================="
-    for name in deepseek openrouter fireworks; do
+    for name in deepseek openrouter fireworks gemini; do
         local url="" key="" model=""
         case "$name" in
             deepseek)   url="$DEEPSEEK_URL"; key="${DEEPSEEK_API_KEY:-}"; model="deepseek-v4-pro" ;;
