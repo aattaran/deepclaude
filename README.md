@@ -89,6 +89,7 @@ Claude Code reads these environment variables to determine where to send API cal
 | **DeepSeek** (default) | `--backend ds` | $0.44 | $0.87 | China | Auto context caching (120x cheaper on repeat turns) |
 | **OpenRouter** | `--backend or` | $0.44 | $0.87 | US | Cheapest, lowest latency from US/EU |
 | **Fireworks AI** | `--backend fw` | $1.74 | $3.48 | US | Fastest inference |
+| **sference** | `--backend sf -w 1h` | (varies) | (varies) | EU | Async background inference, up to 75% off |
 | **Anthropic** | `--backend anthropic` | $3.00 | $15.00 | US | Original Claude Opus (for hard problems) |
 
 ### Setup per backend
@@ -111,7 +112,49 @@ setx FIREWORKS_API_KEY "fw_..."          # Windows
 export FIREWORKS_API_KEY="fw_..."        # macOS/Linux
 ```
 
-## Cost comparison
+**sference** (async background — lower cost, higher latency per turn):
+```bash
+export SFERENCE_API_KEY="sk_..."                    # macOS/Linux
+export SFERENCE_MODEL="moonshotai/Kimi-K2.6"        # optional, this is the default
+export SFERENCE_COMPLETION_WINDOW="1h"              # 1h | 24h (sference); others passed to custom providers
+deepclaude -b sf -w 1h
+```
+
+**Custom background provider** (any Responses API with `background: true`):
+```bash
+export BG_PROVIDER_URL="https://api.example.com"
+export BG_PROVIDER_API_KEY="sk_..."
+export BG_PROVIDER_MODEL="your-model"
+export BG_PROVIDER_WINDOW="1h"
+deepclaude -b bg
+```
+
+## Background providers (`responses-bg`)
+
+Some inference platforms expose an async **Responses API**: submit with `background: true`, poll until complete. Claude Code only speaks Anthropic `/v1/messages`, so deepclaude's proxy translates each turn:
+
+```
+Claude Code  →  POST /v1/messages (Anthropic format, streaming)
+Proxy        →  POST /v1/responses (background: true, completion_window)
+Proxy        →  poll GET /v1/responses/{id}
+Proxy        →  synthesize Anthropic SSE back to Claude Code
+```
+
+**Trade-off:** each agent turn waits in the provider's queue (minutes to hours depending on window). Best for overnight headless runs (`claude -p`) or when cost matters more than latency. Sync backends (DeepSeek, OpenRouter) remain the default for interactive coding.
+
+Control endpoints while the proxy runs:
+```bash
+curl -s http://127.0.0.1:3200/_proxy/status   # mode, window, tool_mode
+curl -sX POST http://127.0.0.1:3200/_proxy/window -d "window=24h"
+curl -s http://127.0.0.1:3200/_proxy/cost
+```
+
+Add a slash command in `~/.claude/commands/sference.md`:
+```
+Switch to sference background mode:
+curl -sX POST http://127.0.0.1:3200/_proxy/mode -d "backend=sference"
+If successful, say: "Switched to sference (background)."
+```
 
 | Usage level | Anthropic Max | deepclaude (DeepSeek) | Savings |
 |---|---|---|---|
