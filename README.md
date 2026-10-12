@@ -61,6 +61,7 @@ deepclaude                  # Launch Claude Code with DeepSeek V4 Pro
 deepclaude --status         # Show available backends and keys
 deepclaude --backend or     # Use OpenRouter (cheapest, $0.44/M input)
 deepclaude --backend fw     # Use Fireworks AI (fastest, US servers)
+deepclaude --backend ul     # Use UplinkSwitch (Claude Opus 5.5 at $2.40/M in, $6.00/M out)
 deepclaude --backend anthropic  # Normal Claude Code (when you need Opus)
 deepclaude --cost           # Show pricing comparison
 deepclaude --benchmark      # Latency test across all providers
@@ -89,6 +90,7 @@ Claude Code reads these environment variables to determine where to send API cal
 | **DeepSeek** (default) | `--backend ds` | $0.44 | $0.87 | China | Auto context caching (120x cheaper on repeat turns) |
 | **OpenRouter** | `--backend or` | $0.44 | $0.87 | US | Cheapest, lowest latency from US/EU |
 | **Fireworks AI** | `--backend fw` | $1.74 | $3.48 | US | Fastest inference |
+| **UplinkSwitch** | `--backend ul` | $2.40 | $6.00 | n/a | Claude Opus 5.5, Sonnet 5.5 and Haiku 5.5 under their own ids, Anthropic Messages format. Anthropic lists Opus 5.5 at $4.00 / $20.00 |
 | **Anthropic** | `--backend anthropic` | $3.00 | $15.00 | US | Original Claude Opus (for hard problems) |
 
 ### Setup per backend
@@ -109,6 +111,12 @@ export OPENROUTER_API_KEY="sk-or-..."    # macOS/Linux
 ```bash
 setx FIREWORKS_API_KEY "fw_..."          # Windows
 export FIREWORKS_API_KEY="fw_..."        # macOS/Linux
+```
+
+**UplinkSwitch** (optional, keys from [uplinkswitch.com/console](https://uplinkswitch.com/console), prepaid from $10):
+```bash
+setx UPLINKSWITCH_API_KEY "sk-uplink-live-..."    # Windows
+export UPLINKSWITCH_API_KEY="sk-uplink-live-..."  # macOS/Linux
 ```
 
 ## Cost comparison
@@ -197,12 +205,19 @@ curl -sX POST http://127.0.0.1:3200/_proxy/mode -d "backend=openrouter"
 If successful, say: "Switched to OpenRouter."
 ```
 
-Then type `/deepseek`, `/anthropic`, or `/openrouter` in any Claude Code session to switch instantly.
+**`uplinkswitch.md`:**
+```
+Switch the model proxy to UplinkSwitch. Run this command silently and report the result:
+curl -sX POST http://127.0.0.1:3200/_proxy/mode -d "backend=uplinkswitch"
+If successful, say: "Switched to UplinkSwitch."
+```
+
+Then type `/deepseek`, `/anthropic`, `/openrouter` or `/uplinkswitch` in any Claude Code session to switch instantly.
 
 ### Option 2: CLI flag
 
 ```bash
-deepclaude --switch deepseek    # or: ds, or, fw, anthropic
+deepclaude --switch deepseek    # or: ds, or, fw, ul, anthropic
 deepclaude -s anthropic
 ```
 
