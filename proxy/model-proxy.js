@@ -28,6 +28,7 @@ const PRICING_PER_M = {
     deepseek:   { input: 0.44,  output: 0.87 },
     openrouter: { input: 0.44,  output: 0.87 },
     fireworks:  { input: 1.74,  output: 3.48 },
+    uplinkswitch: { input: 2.40, output: 6.00 },
     anthropic:  { input: 3.00,  output: 15.00 },
     _single:    { input: 0.44,  output: 0.87 },
 };
